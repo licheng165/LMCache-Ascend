@@ -2107,6 +2107,46 @@ class AscendLMCacheEngine(LMCacheEngine):
                         mem_obj.ref_count_down()
             append.rollback()
 
+    def connector_only_dense_import(
+        self,
+        token_ids: list[int],
+        *,
+        latent_block_table: list[int],
+        indexer_block_table: list[int],
+        latent_slot_mapping: list[int],
+        indexer_slot_mapping: list[int],
+        kv_caches: list[Any],
+        req_id: str,
+    ) -> int:
+        """Full-layer dense import for PD Decode bootstrap (design 14.2.1).
+
+        Dense-bootstrap BOTH DSA groups into the Decode NPU without depending
+        on ``attn_metadata`` or a model forward.  All get / D2H-H2D stream
+        fences and participant materialization must complete before the caller
+        (executor) aggregates an ``import_ready`` receipt; the Scheduler does
+        not allow model forward until that quorum is reached.
+
+        Args:
+            token_ids: canonical token history to import.
+            latent_block_table / indexer_block_table: target NPU block tables.
+            latent_slot_mapping / indexer_slot_mapping: target slot mappings.
+            kv_caches: per-layer NPU KV cache tensors (latent group).
+            req_id: request identifier for logging/tracking.
+
+        Returns:
+            The number of tokens materialized on success.
+
+        Raises:
+            NotImplementedError: the NPU materialization path is the
+                integration point completed alongside the vLLM-Ascend runner;
+                fail closed rather than silently emitting an incomplete source.
+        """
+        raise NotImplementedError(
+            "connector_only_dense_import NPU materialization is wired in the "
+            "vLLM-Ascend model runner; the control-plane contract lives here. "
+            "PD Decode must not enter model forward until this returns."
+        )
+
     def retrieve_layer_head_token_wise(
         self,
         tokens: Union[torch.Tensor, list[int]],

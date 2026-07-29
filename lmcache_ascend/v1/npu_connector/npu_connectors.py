@@ -3792,6 +3792,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
 
             if not cpu_tensors:
+                # A required layer that carries memory objects but has no
+                # usable CPU tensors is a corrupt/incomplete sparse source.
+                # Silent continuation would let an incomplete source be falsely
+                # treated as complete and read uninitialized NPU memory, so fail
+                # closed (design section 18.4). An empty memory_objs_layer is a
+                # legitimate bootstrap "nothing for this layer" and continues.
+                if memory_objs_layer:
+                    raise RuntimeError(
+                        "Ascend sparse layer transfer: required layer has "
+                        f"{len(memory_objs_layer)} memory object(s) but no "
+                        f"usable CPU tensor (layer_id={layer_id}, "
+                        f"kv_group={kv_group}, req_id={req_id}). Refusing to "
+                        "emit an incomplete sparse source."
+                    )
                 continue
 
             chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(

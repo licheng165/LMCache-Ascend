@@ -124,8 +124,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         )
 
         # Lookup pins are request-scoped; release via _drop_worker_retrieve_state.
+        # Preemption must quiesce ALL DSA worker state for the old RequestKey,
+        # not only retrieve pins: prepared sparse sources, pending stores and
+        # execution leases must all be dropped before the Scheduler frees the
+        # old blocks (design section 15.4).
         for req_id in preempted_req_ids:
             self._drop_worker_retrieve_state(req_id)
+            self._drop_dsa_worker_state(req_id)
 
         if not self.store_async or self.kv_role == "kv_consumer":
             return
@@ -138,6 +143,45 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "Handled preemptions after draining async stores: req_ids=%s",
                 sorted(waited_req_ids),
             )
+        # NOTE: a full typed preemption quiesce additionally requires the NPU
+        # runner to stop in-flight retrieve/store DMA and emit a
+        # ``preemption_quiesce_ready`` receipt the Scheduler waits on before
+        # freeing both groups' blocks. That runner-side fence is wired in the
+        # vLLM-Ascend model runner; this connector side drops its worker state
+        # and drains pending stores so no freed block is re-read.
+
+    def _drop_dsa_worker_state(self, req_id: str) -> None:
+        """Drop DSA prepared-source / lease state for a request.
+
+        Idempotent; safe to call when no DSA state exists (threshold routing
+        disabled).  Mirrors the retrieve-state drop so preemption of a SPARSE
+        request cannot leave a dangling prepared source pointing at freed
+        blocks.
+        """
+        worker_state_map = getattr(self, "_worker_retrieve_states", None)
+        if worker_state_map is None:
+            return
+        state = worker_state_map.pop(req_id, None)
+        if state is None:
+            return
+        prepared = getattr(state, "prepared_sparse_sources", None)
+        if prepared:
+            prepared.clear()
+
+    def get_request_route_state(self, req_id: str) -> Optional[str]:
+        """Return the authoritative DSA route state string for a request.
+
+        Workers/runners query this instead of re-deriving sparse mode from
+        prompt_len (design section 10.1).  Returns None when no snapshot was
+        published for the request (LEGACY / threshold disabled).
+        """
+        trackers = getattr(self, "_request_trackers", None)
+        if trackers is None:
+            return None
+        tracker = trackers.get(req_id)
+        if tracker is None:
+            return None
+        return getattr(tracker, "dsa_route_state", None)
 
     def request_finished(
         self,
