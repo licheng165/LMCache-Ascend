@@ -41,6 +41,11 @@ LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 
 
 def _mtp_dw_diag_enabled() -> bool:
+    # Legacy [MTP_DW] emitters are disabled once the unified dsa_offload.v1
+    # protocol is active (see §4 of the DSA log enhancement design).
+    from lmcache.dsa_offload import DiagLevel, get_dsa_diag_level
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
 
@@ -50,6 +55,15 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     payload = {"schema": 1, "stage": stage, "owner": "lmcache_ascend_store"}
     payload.update(fields)
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+# Structured dsa_offload.v1 emitter for the Ascend store path (§7.5). No-op
+# until VLLM_ASCEND_DSA_DIAG_LEVEL is set; legacy [MTP_DW] emitters above are
+# disabled in that case.
+from lmcache.dsa_offload import DiagLevel as _DSADiagLevel
+from lmcache.dsa_offload import dsa_logger_for as _dsa_logger_for
+
+_dsa_log = _dsa_logger_for("lmcache_ascend.store")
 
 
 def _dsa_debug_enabled() -> bool:
@@ -1404,6 +1418,18 @@ class AscendLMCacheEngine(LMCacheEngine):
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
+        # Structured store group submit summary (§7.5). One per store operation
+        # rather than per layer; logical bytes are summed from memory objs as the
+        # generators are produced. Cheap: no tensor content reads.
+        if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+            kv_group = int(kwargs.get("kv_group", 0))
+            _dsa_log.emit(
+                "store.group.submit",
+                outcome="ok",
+                level=_DSADiagLevel.LIFECYCLE,
+                kv_group=kv_group,
+                kv_kind="latent" if kv_group == 0 else "indexer",
+            )
         """
         Store the KV cache in a layerwise manner.
 

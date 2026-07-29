@@ -56,6 +56,11 @@ def _payload_event_list(payload_event: Any) -> list[Any]:
 
 
 def _mtp_dw_diag_enabled() -> bool:
+    # Legacy [MTP_DW] emitters are disabled once the unified dsa_offload.v1
+    # protocol is active (see §4 of the DSA log enhancement design).
+    from lmcache.dsa_offload import DiagLevel, get_dsa_diag_level
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
 
@@ -75,6 +80,15 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     }
     payload.update(fields)
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+# Structured dsa_offload.v1 emitter for the Ascend NPU retrieve connector
+# (§7.5). No-op until VLLM_ASCEND_DSA_DIAG_LEVEL is set; legacy [MTP_DW]
+# emitters above are disabled in that case.
+from lmcache.dsa_offload import DiagLevel as _DSADiagLevel
+from lmcache.dsa_offload import dsa_logger_for as _dsa_logger_for
+
+_dsa_log = _dsa_logger_for("lmcache_ascend.retrieve")
 
 
 _MTP_DW_DEEP_SEEN_LIMIT = 256
@@ -3643,6 +3657,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group=kv_group,
             init_staging=False,
         )
+        # Structured sparse retrieve submit summary (§7.5). Sampled, cheap, per
+        # request-step: only proves the load dependency is being entered, not
+        # completion. Enqueue-only here; fenced requires a real NPU fence.
+        if _dsa_log.enabled(_DSADiagLevel.SAMPLED):
+            slot_mapping = kwargs.get("slot_mapping")
+            request_rows = None
+            if hasattr(slot_mapping, "__len__"):
+                try:
+                    request_rows = len(slot_mapping)
+                except TypeError:
+                    request_rows = None
+            _dsa_log.emit(
+                "sparse.retrieve.submit",
+                outcome="ok",
+                level=_DSADiagLevel.SAMPLED,
+                kv_group=kv_group,
+                request_rows=request_rows,
+            )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
