@@ -208,6 +208,25 @@ def test_sparse_memory_update_resets_fast_direct_state() -> None:
     assert connector._sparse_destination_plans[0] is destination_plan
 
 
+def test_route_generation_invalidation_resets_source_state_not_plan() -> None:
+    """A DSA route generation change must reset the source-layout sparse cache
+    (it was derived from the previous route's source tensors) but preserve the
+    process-invariant destination plan (design 15.4 step 5)."""
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector._sparse_direct_layer_states = {(123, 0, 0): object()}
+    connector._sparse_direct_validated_layers = {(0, 0)}
+    destination_plan = object()
+    connector._sparse_destination_plans = {0: destination_plan}
+    connector._last_dsa_route_generation = 1
+
+    connector.invalidate_sparse_caches_for_route_generation(new_generation=2)
+
+    assert connector._sparse_direct_layer_states is None
+    assert connector._sparse_direct_validated_layers == set()
+    assert connector._sparse_destination_plans[0] is destination_plan
+    assert connector._last_dsa_route_generation == 2
+
+
 def test_shared_cpu_store_publication_fences_store_stream() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.store_stream = _TrackingStream("store")

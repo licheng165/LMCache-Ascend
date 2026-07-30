@@ -1501,6 +1501,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._sparse_direct_validated_layers: set = set()
         # One process-owned destination plan per latent/indexer KV group.
         self._sparse_destination_plans: dict[int, _SparseDestinationPlan] = {}
+        # Last seen DSA route generation; used to invalidate source-layout
+        # sparse caches when a request's offload route changes.
+        self._last_dsa_route_generation: Optional[int] = None
 
     @contextmanager
     def defer_sparse_load_consumer_wait(self) -> Generator[None, None, None]:
@@ -2129,7 +2132,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         target_slot_mapping: Union[torch.Tensor, list],
         selected_token_counts: Optional[Union[torch.Tensor, list]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Use caller-provided target slots for row-wise MTP sparse loads."""
+        """Use caller-provided target slots for row-wise MTP sparse loads.
+
+        The compact payload rows, ``selected_token_counts`` and
+        ``target_slot_mapping`` must be strictly same-ordered and aligned to the
+        compact offloaded-request ids (design 14.5). A row with
+        ``selected_token_counts == 0`` is preserved (the direct-transfer kernel
+        skips it via the count) so an offloaded request that selected nothing
+        this step does not cause a row mismatch for the other requests.
+        """
         if selected_token_idx is None:
             selected_token_idx = []
         if not isinstance(selected_token_idx, torch.Tensor):
@@ -2509,6 +2520,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         process-owned destination state and consumes request pointers dynamically.
         """
         self._reset_sparse_direct_layer_states()
+
+    def invalidate_sparse_caches_for_route_generation(
+        self,
+        new_generation: Optional[int] = None,
+    ) -> None:
+        """Invalidate sparse caches when a request's DSA route generation changes.
+
+        A route transition (RESIDENT -> PROMOTING -> OFFLOADED, or preemption/
+        recompute) changes which requests carry a selective-load payload and
+        their committed frontier. The destination-layout plan cache is
+        process-invariant and intentionally preserved; only the source-layout
+        fast-path state (which is tied to the prior payload's source tensors)
+        is reset so a stale source is never reused for the new route
+        (design 15.4 step 5). ``new_generation`` is recorded for diagnostics.
+        """
+        self._reset_sparse_direct_layer_states()
+        self._last_dsa_route_generation = new_generation
 
     def _resolve_sparse_chunk_ptrs_npu(
         self,
