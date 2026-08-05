@@ -485,6 +485,15 @@ def _patch_vllm_v1_adapter():
             and getattr(config, "dsa_two_groups", False)
         )
 
+    def get_dsa_operation_receipts(self):
+        return self._lmcache_engine.get_dsa_operation_receipts()
+
+    def get_dsa_control_events(self):
+        return self._lmcache_engine.get_dsa_control_events()
+
+    def get_released_dsa_source_leases(self):
+        return self._lmcache_engine.get_released_dsa_source_leases()
+
     vllm_lmcache_connector.LMCacheConnectorV1.supports_dsa_index_lmcache = True
     vllm_lmcache_connector.LMCacheConnectorV1.uses_layerwise_model_callbacks = property(
         uses_layerwise_model_callbacks
@@ -493,6 +502,15 @@ def _patch_vllm_v1_adapter():
         property(supports_staged_sfa_sparse_load)
     )
     vllm_lmcache_connector.LMCacheConnectorV1.handle_preemptions = handle_preemptions
+    vllm_lmcache_connector.LMCacheConnectorV1.get_dsa_operation_receipts = (
+        get_dsa_operation_receipts
+    )
+    vllm_lmcache_connector.LMCacheConnectorV1.get_dsa_control_events = (
+        get_dsa_control_events
+    )
+    vllm_lmcache_connector.LMCacheConnectorV1.get_released_dsa_source_leases = (
+        get_released_dsa_source_leases
+    )
 
 
 def _patch_cache_engine():

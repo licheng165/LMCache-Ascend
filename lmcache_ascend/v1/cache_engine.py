@@ -1047,6 +1047,40 @@ class AscendLMCacheEngine(LMCacheEngine):
                 except TypeError:
                     lazy_init(kvcaches)
 
+    def prepare_dsa_store_exchange(
+        self,
+        *,
+        kvcaches: List[torch.Tensor],
+        kv_group: int,
+    ) -> None:
+        """Initialize one group's NPU layout before shared DSA publication.
+
+        Args:
+            kvcaches: This worker's vLLM cache tensors for the KV group.
+            kv_group: The latent or indexer group being published.
+
+        Raises:
+            RuntimeError: The connector cannot prove an accelerator layout or
+                cannot resolve registered host tensors to NPU pointers.
+        """
+        if not kvcaches:
+            raise RuntimeError("DSA shared source KV group has no NPU caches")
+        self._ensure_layerwise_connector_layout(
+            kvcaches=kvcaches,
+            kv_group=kv_group,
+        )
+        connector = self.gpu_connector
+        layouts = getattr(connector, "_group_layouts", None)
+        if isinstance(layouts, dict) and kv_group not in layouts:
+            raise RuntimeError("DSA shared source group layout is unavailable")
+        kv_device = getattr(connector, "kv_device", None)
+        if kv_device is None or torch.device(kv_device).type == "cpu":
+            raise RuntimeError("DSA shared source NPU device is unavailable")
+        if not callable(
+            getattr(connector, "append_sparse_chunk_ptr_cache_for_layer", None)
+        ):
+            raise RuntimeError("DSA shared source pointer resolver is unavailable")
+
     def _expected_shared_cpu_chunk_metadata(
         self,
         *,
@@ -1520,12 +1554,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            if self._layerwise_chunk_fully_stored(
+            if not self._layerwise_chunk_should_store(
                 keys_multi_layer,
                 req_id=req_id,
                 kv_group=kv_group,
                 start=start,
                 end=end,
+                force_rewrite=bool(kwargs.get("dsa_command_store", False)),
             ):
                 continue
 
@@ -1764,6 +1799,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             memory_objs[layer_id],
                             location=self.store_location,
                         )
+                        store_result.required_futures.extend(required_futures)
                         self._track_sync_store_futures(required_futures)
                         for mem_obj in memory_objs[layer_id]:
                             pending_store_release.pop(id(mem_obj), None)
@@ -1778,6 +1814,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         flattened_memory_objs,
                         location=self.store_location,
                     )
+                    store_result.required_futures.extend(required_futures)
                     self._track_sync_store_futures(required_futures)
                     for mem_obj in flattened_memory_objs:
                         pending_store_release.pop(id(mem_obj), None)

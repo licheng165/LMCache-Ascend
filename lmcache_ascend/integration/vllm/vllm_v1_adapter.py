@@ -82,8 +82,47 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         }
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        super()._finish_save_batch(_save_context)
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
-            self.lmcache_engine.wait_for_pending_sync_stores()
+            try:
+                self.lmcache_engine.wait_for_pending_sync_stores()
+            except Exception as error:
+                if not getattr(self, "_dsa_store_progress", None):
+                    raise
+                raise RuntimeError("DSA backend future failed") from error
+        if getattr(self, "_dsa_store_progress", None):
+            self._fence_dsa_npu_streams()
+
+    def _fence_dsa_npu_streams(self) -> None:
+        """Fence the current NPU stream and connector-owned transfer streams."""
+        if not hasattr(torch, "npu") or not hasattr(torch.npu, "current_stream"):
+            raise RuntimeError("NPU stream support is unavailable for DSA fencing")
+        streams = [torch.npu.current_stream()]
+        engine = self.lmcache_engine
+        connector = (
+            getattr(engine, "gpu_connector", None)
+            if engine is not None
+            else None
+        )
+        for name in ("store_stream", "load_stream", "broadcast_stream"):
+            stream = getattr(connector, name, None)
+            if stream is not None:
+                streams.append(stream)
+        synchronized: set[int] = set()
+        for stream in streams:
+            if id(stream) in synchronized:
+                continue
+            synchronize = getattr(stream, "synchronize", None)
+            if not callable(synchronize):
+                raise RuntimeError(f"DSA NPU stream {stream!r} cannot be fenced")
+            synchronize()
+            synchronized.add(id(stream))
+
+    def _fence_dsa_source_activation(self) -> None:
+        self._fence_dsa_npu_streams()
+
+    def _fence_dsa_source_use(self) -> None:
+        self._fence_dsa_npu_streams()
 
     def _handle_save_request_error(
         self,
@@ -123,26 +162,28 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             sorted(preempted_req_ids),
         )
 
-        # Lookup pins are request-scoped; release via _drop_worker_retrieve_state.
-        # Preemption must quiesce ALL DSA worker state for the old RequestKey,
-        # not only retrieve pins: prepared sparse sources, pending stores and
-        # execution leases must all be dropped before the Scheduler frees the
-        # old blocks (design section 15.4).
-        for req_id in preempted_req_ids:
-            self._drop_worker_retrieve_state(req_id)
-            self._drop_dsa_worker_state(req_id)
-
-        if not self.store_async or self.kv_role == "kv_consumer":
-            return
-
-        waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
-            preempted_req_ids
-        )
-        if waited_req_ids:
-            logger.info(
-                "Handled preemptions after draining async stores: req_ids=%s",
-                sorted(waited_req_ids),
+        if self.store_async and self.kv_role != "kv_consumer":
+            waited_req_ids = self.lmcache_engine.wait_for_pending_stores(
+                preempted_req_ids
             )
+            if waited_req_ids:
+                logger.info(
+                    "Handled preemptions after draining async stores: req_ids=%s",
+                    sorted(waited_req_ids),
+                )
+
+        # Do not release generation-owned CPU objects until all NPU/connector
+        # streams and source leases are proven quiescent. Legacy preemption
+        # remains unchanged when no generation-bound source exists.
+        has_dsa_sources = any(
+            source.request_key.request_id in preempted_req_ids
+            for source in getattr(self, "_dsa_sealed_sources", {}).values()
+        )
+        if has_dsa_sources:
+            self._fence_dsa_npu_streams()
+        self._release_dsa_source_leases_for_requests(preempted_req_ids)
+        for req_id in preempted_req_ids:
+            self._drop_dsa_worker_state(req_id)
         # NOTE: a full typed preemption quiesce additionally requires the NPU
         # runner to stop in-flight retrieve/store DMA and emit a
         # ``preemption_quiesce_ready`` receipt the Scheduler waits on before
@@ -158,15 +199,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         request cannot leave a dangling prepared source pointing at freed
         blocks.
         """
-        worker_state_map = getattr(self, "_worker_retrieve_states", None)
-        if worker_state_map is None:
-            return
-        state = worker_state_map.pop(req_id, None)
-        if state is None:
-            return
-        prepared = getattr(state, "prepared_sparse_sources", None)
-        if prepared:
-            prepared.clear()
+        if self._retire_dsa_request_sources(req_id):
+            self._drop_worker_retrieve_state(req_id)
 
     def get_request_route_state(self, req_id: str) -> Optional[str]:
         """Return the authoritative DSA route state string for a request.
