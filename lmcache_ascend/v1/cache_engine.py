@@ -2105,7 +2105,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if not missing_chunks:
                     mem_objs_layer = []
                 else:
-                    envelope = self._receive_shared_envelope()
+                    envelope = self._receive_matching_shared_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                    )
                     self._validate_shared_layerwise_envelope(
                         envelope,
                         req_id=req_id,
