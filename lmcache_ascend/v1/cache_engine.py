@@ -2333,6 +2333,83 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         return counts.pop() if counts else 0
 
+    def _num_layers_for_kv_group(self, kv_group: int) -> int:
+        """Resolve the authoritative transfer cardinality for a KV group.
+
+        Prefers the NPU connector's registered per-group layout (the runtime
+        truth of how many layer rows the group transfers), then the
+        LMCacheEngine registered/declared group cardinality. Fail-closes
+        when the two sources disagree. Legacy single-group deployments
+        fall back to the global model layer count.
+
+        Args:
+            kv_group: The KV group index (0 = latent, 1 = indexer).
+
+        Returns:
+            The number of layer rows this group transfers.
+
+        Raises:
+            ValueError: If the connector layout and the engine-level group
+                cardinality disagree.
+        """
+        get_num_layers = getattr(self.gpu_connector, "get_num_layers", None)
+        connector_layers = (
+            get_num_layers(kv_group) if callable(get_num_layers) else None
+        )
+        engine_layers = self.num_layers_for_group(kv_group)
+        if (
+            connector_layers is not None
+            and int(connector_layers) != engine_layers
+        ):
+            raise ValueError(
+                "NPU connector group layout disagrees with the engine group "
+                f"cardinality: kv_group={kv_group} "
+                f"connector={int(connector_layers)} engine={engine_layers}. "
+                "Check the registered KV caches and the kv_group_layers "
+                "extra config."
+            )
+        if connector_layers is not None:
+            return int(connector_layers)
+        return engine_layers
+
+    def _num_transfer_layers_for_call(
+        self,
+        kv_group: int,
+        kwargs: dict,
+    ) -> int:
+        """Resolve and cross-validate the cardinality for one layerwise call.
+
+        Uses _num_layers_for_kv_group(kv_group) and fail-closes against the
+        per-group kvcaches list passed by the serving-engine adapter when
+        present: the registered runtime buffers are the physical truth of
+        how many layer rows this call transfers.
+
+        Args:
+            kv_group: The KV group index of the call.
+            kwargs: The layerwise call kwargs (may contain ``kvcaches``).
+
+        Returns:
+            The number of layer rows for this call.
+
+        Raises:
+            ValueError: If the passed kvcaches length disagrees with the
+                resolved cardinality.
+        """
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        kvcaches = kwargs.get("kvcaches")
+        if kvcaches is not None:
+            kvcaches_len = len(kvcaches)
+            if kvcaches_len != num_layers:
+                raise ValueError(
+                    "Layerwise transfer cardinality mismatch: kv_group="
+                    f"{kv_group} resolved_layers={num_layers} "
+                    f"kvcaches_layers={kvcaches_len}. The registered KV "
+                    "caches for this group disagree with the resolved "
+                    "group cardinality (check kv_group_layers and the "
+                    "serving-engine group registration)."
+                )
+        return num_layers
+
     def _ensure_layerwise_connector_layout(self, **kwargs) -> None:
         """Initialize connector KV layout before allocating layerwise chunks.
 

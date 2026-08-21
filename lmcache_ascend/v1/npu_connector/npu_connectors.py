@@ -1438,6 +1438,9 @@ class _GroupLayout:
         "kv_device",
         "gpu_buffer_allocator",
         "staging_bytes_per_slot",
+        "num_layers",
+        "layer_indices",
+        "layout_signature",
     )
 
     def __init__(self) -> None:
@@ -1452,6 +1455,9 @@ class _GroupLayout:
         self.kv_device: Optional[torch.device] = None
         self.gpu_buffer_allocator: Optional[GPUMemoryAllocator] = None
         self.staging_bytes_per_slot: int = 0
+        self.num_layers: int = 0
+        self.layer_indices: tuple[int, ...] = ()
+        self.layout_signature: Optional[str] = None
 
 
 class _SparseDestinationPlan:
@@ -3417,6 +3423,55 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group = self._current_kv_group
         return self._group_layouts.get(kv_group)
 
+    def get_num_layers(self, kv_group: int = 0) -> Optional[int]:
+        """Return the authoritative layer count of a KV group.
+
+        The count comes from the registered group caches captured at layout
+        initialization (e.g. 79 for latent, 22 for indexer under
+        dsa_two_groups). This is stable across interleaved per-group calls,
+        unlike the mirrored ``self.num_layers``.
+
+        Args:
+            kv_group: The KV group index.
+
+        Returns:
+            The group's layer count, or None when the group layout has not
+            been initialized yet (callers fall back to legacy resolution).
+        """
+        layout = self._group_layouts.get(kv_group)
+        if layout is None or layout.num_layers <= 0:
+            return None
+        return layout.num_layers
+
+    def get_layer_indices(self, kv_group: int = 0) -> Optional[tuple[int, ...]]:
+        """Return the group-local layer indices of a KV group.
+
+        Args:
+            kv_group: The KV group index.
+
+        Returns:
+            The group-local layer index tuple, or None when the group layout
+            has not been initialized yet.
+        """
+        layout = self._group_layouts.get(kv_group)
+        if layout is None or not layout.layer_indices:
+            return None
+        return layout.layer_indices
+
+    def _expected_group_layers(self, kv_group: Optional[int]) -> int:
+        """Resolve the per-group transfer row count for invariant checks.
+
+        Prefers the authoritative layout cardinality and falls back to the
+        mirrored instance count (legacy single-group contract) when the
+        layout has not been initialized.
+        """
+        if kv_group is None:
+            kv_group = self._current_kv_group
+        group_layers = self.get_num_layers(kv_group)
+        if group_layers is not None:
+            return group_layers
+        return self.num_layers
+
     def set_layerwise_staging_concurrency(self, n: int) -> None:
         """Size per-group staging pools for concurrent layerwise transfers."""
         n = max(1, int(n))
@@ -3654,6 +3709,14 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._reset_sparse_direct_layer_states()
             first_layer_cache = kv_caches[0]
 
+            # Authoritative per-group cardinality: the registered group caches
+            # are the runtime truth of how many layer rows this group
+            # transfers (GLM-5.2: latent=79, indexer=22). The mirrored
+            # instance self.num_layers is last-wins across interleaved group
+            # calls, so per-group readers must use layout.num_layers.
+            layout.num_layers = len(kv_caches)
+            layout.layer_indices = tuple(range(len(kv_caches)))
+
             if layout.kv_format == KVCacheFormat.SEPARATE_KV:
                 key_tensor = first_layer_cache[0]
                 value_tensor = first_layer_cache[1]
@@ -3748,24 +3811,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 ]
                 payload = {
                     "format": layout.kv_format.name,
-                    "layers": self.num_layers,
+                    "layers": layout.num_layers,
                     "chunk_size": self.lmcache_chunk_size,
                     "planes": planes,
                     "page_bytes": (
                         sum(plane["token_bytes"] for plane in planes)
                         * self.lmcache_chunk_size
-                        * self.num_layers
+                        * layout.num_layers
                     ),
                 }
                 encoded = json.dumps(
                     payload, sort_keys=True, separators=(",", ":")
                 )
+                layout.layout_signature = hashlib.blake2b(
+                    encoded.encode(), digest_size=8
+                ).hexdigest()
                 logger.info(
                     "LMCache NPU payload layout: "
                     "signature=%s kv_group=%d schema=%s",
-                    hashlib.blake2b(
-                        encoded.encode(), digest_size=8
-                    ).hexdigest(),
+                    layout.layout_signature,
                     kv_group,
                     payload,
                 )
