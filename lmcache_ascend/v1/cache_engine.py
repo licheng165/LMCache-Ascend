@@ -741,7 +741,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         kv_group=group,
                     )
                 )[2]
-            layer_keys = key.split_layers(self.num_layers)
+            layer_keys = key.split_layers(self._num_layers_for_kv_group(group))
             hits, _ = self.storage_manager.batched_contains(
                 list(layer_keys), search_range=["RemoteBackend"]
             )
@@ -1814,8 +1814,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
+        num_layers: Optional[int] = None,
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
+        if num_layers is None:
+            num_layers = self.num_layers
         new_tensors: List[torch.Tensor] = []
         append_ptrs_fn = getattr(
             self.gpu_connector,
@@ -1865,13 +1868,11 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if cached_memory_objs is not None:
             if not cached_memory_objs:
-                cached_memory_objs.extend(
-                    [] for _ in range(self.num_layers)
-                )
+                cached_memory_objs.extend([] for _ in range(num_layers))
             cached_memory_objs[layer_id].extend(mem_objs_layer)
         if cached_tensors is not None:
             if not cached_tensors:
-                cached_tensors.extend([] for _ in range(self.num_layers))
+                cached_tensors.extend([] for _ in range(num_layers))
             cached_tensors[layer_id].extend(new_tensors)
 
     def _append_group_store_tensors(
@@ -1956,6 +1957,8 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         pointer_first = retained_group and not any(cached_tensors or ())
         if retained_group:
+            # The retained source covers exactly this group's layer rows.
+            num_layers = len(mem_objs_by_layer)
             layer_counts = (
                 len(cached_memory_objs),
                 len(cached_chunk_dev_ptrs),
@@ -1971,13 +1974,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                 or any(cached_tensors or ())
             )
             if has_prefix_data:
-                if any(count != self.num_layers for count in layer_counts):
+                if any(count != num_layers for count in layer_counts):
                     raise ValueError(
                         "Sparse group pointer prefix layer coverage mismatch: "
                         f"owners/host/NPU={layer_counts}, "
-                        f"expected={self.num_layers}."
+                        f"expected={num_layers}."
                     )
-                for layer_id in range(self.num_layers):
+                for layer_id in range(num_layers):
                     owner_count = len(cached_memory_objs[layer_id])
                     host_count = len(cached_chunk_dev_ptrs[layer_id])
                     row = cached_chunk_ptrs_npu[layer_id]
@@ -2027,6 +2030,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                    num_layers=len(owners_by_layer),
                 )
             return
         group_append(
@@ -2036,12 +2040,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         if cached_memory_objs is not None:
             if not cached_memory_objs:
-                cached_memory_objs.extend([] for _ in range(self.num_layers))
+                cached_memory_objs.extend(
+                    [] for _ in range(len(mem_objs_by_layer))
+                )
             for layer_id, mem_objs_layer in enumerate(owners_by_layer):
                 cached_memory_objs[layer_id].extend(mem_objs_layer)
         if cached_tensors is not None and not pointer_first:
             if not cached_tensors:
-                cached_tensors.extend([] for _ in range(self.num_layers))
+                cached_tensors.extend(
+                    [] for _ in range(len(mem_objs_by_layer))
+                )
             for layer_id, tensors in enumerate(tensors_by_layer):
                 cached_tensors[layer_id].extend(tensors)
 
@@ -2051,12 +2059,15 @@ class AscendLMCacheEngine(LMCacheEngine):
         handles: List,
         cached_shared_handles: Optional[List],
         chunk_index_base: int = 0,
+        kv_group: int = 0,
     ) -> None:
         """Append one validated suffix to a layer's shared handle cache."""
         if cached_shared_handles is None:
             return
         if not cached_shared_handles:
-            cached_shared_handles.extend([] for _ in range(self.num_layers))
+            cached_shared_handles.extend(
+                [] for _ in range(self._num_layers_for_kv_group(kv_group))
+            )
         while len(cached_shared_handles) <= layer_id:
             cached_shared_handles.append([])
         layer_handles = cached_shared_handles[layer_id]
@@ -2108,10 +2119,11 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> Optional[tuple[List[int], List[int], List[List[CacheEngineKey]]]]:
         """Hash only a chunk-aligned suffix after validating the cached prefix."""
         chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
+        num_layers = self._num_layers_for_kv_group(kv_group)
         if (
             chunk_size <= 0
             or not cached_keys
-            or len(cached_keys) != self.num_layers
+            or len(cached_keys) != num_layers
             or not cached_starts
             or len(cached_starts) != len(cached_ends)
             or any(len(layer) != len(cached_starts) for layer in cached_keys)
@@ -2155,7 +2167,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         for chunk_index in range(len(cached_starts)):
             chunk_hash = None
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 cached_key = cached_keys[layer_id][chunk_index]
                 if (
                     not isinstance(cached_key, CacheEngineKey)
@@ -2190,7 +2202,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
-            layer_keys = key.split_layers(self.num_layers)
+            layer_keys = key.split_layers(num_layers)
             if any(
                 layer_key.layer_id != layer_id
                 or layer_key.kv_group != kv_group
@@ -2309,18 +2321,20 @@ class AscendLMCacheEngine(LMCacheEngine):
         self,
         cached_tensors: Optional[List],
         cached_memory_objs: Optional[List],
+        kv_group: int = 0,
     ) -> int:
+        num_layers = self._num_layers_for_kv_group(kv_group)
         counts = {
             count
             for count in (
                 self._uniform_layer_cache_chunks(
                     cached_tensors,
-                    self.num_layers,
+                    num_layers,
                     "tensor cache",
                 ),
                 self._uniform_layer_cache_chunks(
                     cached_memory_objs,
-                    self.num_layers,
+                    num_layers,
                     "MemoryObj cache",
                 ),
             )
@@ -2529,7 +2543,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_ends: List[int],
         retrieve_kwargs: Optional[dict],
     ) -> Optional[str]:
-        if not cached_keys or len(cached_keys) < self.num_layers:
+        kwargs = retrieve_kwargs or {}
+        req_id = self._get_req_id(kwargs)
+        kv_group = int(kwargs.get("kv_group", 0) or 0)
+        num_layers = self._num_layers_for_kv_group(kv_group)
+        if not cached_keys or len(cached_keys) < num_layers:
             return None
         if not cached_starts or not cached_ends or not cached_keys[0]:
             return None
@@ -2537,19 +2555,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         chunk_count = min(
             len(cached_starts),
             len(cached_ends),
-            *(len(cached_keys[layer_id]) for layer_id in range(self.num_layers)),
+            *(len(cached_keys[layer_id]) for layer_id in range(num_layers)),
         )
         if chunk_count <= 0:
             return None
 
-        kwargs = retrieve_kwargs or {}
-        req_id = self._get_req_id(kwargs)
-        kv_group = int(kwargs.get("kv_group", 0) or 0)
         location: Optional[str] = None
         for chunk_index in range(chunk_count):
             keys_multi_layer = [
                 cached_keys[layer_id][chunk_index]
-                for layer_id in range(self.num_layers)
+                for layer_id in range(num_layers)
             ]
             current_location = self._layerwise_chunk_location_if_fully_stored(
                 keys_multi_layer,
@@ -2608,6 +2623,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             kv_group = 0
             if retrieve_kwargs is not None:
                 kv_group = int(retrieve_kwargs.get("kv_group", 0) or 0)
+            num_layers = self._num_layers_for_kv_group(kv_group)
             shared_rank0_retrieve = (
                 retrieve_kwargs is not None
                 and self._should_use_shared_layerwise_retrieve(kv_group)
@@ -2700,7 +2716,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if new_chunk_plan is not None:
                     new_chunk_plan.append((start, end, key.chunk_hash))
 
-                keys_multi_layer = key.split_layers(self.num_layers)
+                keys_multi_layer = key.split_layers(num_layers)
                 if sampled_worker_retrieve:
                     current_location = "mixed"
                 elif shared_rank0_retrieve:
@@ -2787,7 +2803,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 chunk_idx >= len(cached_keys[layer_id])
                                 or cached_keys[layer_id][chunk_idx]
                                 != new_keys[layer_id][relative_chunk_idx]
-                                for layer_id in range(self.num_layers)
+                                for layer_id in range(num_layers)
                             ):
                                 raise ValueError(
                                     "Sparse retrieve cached prefix key mismatch "
@@ -2802,7 +2818,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
                     cached_starts.append(start)
                     cached_ends.append(end)
-                    for layer_id in range(self.num_layers):
+                    for layer_id in range(num_layers):
                         cached_keys[layer_id].append(
                             new_keys[layer_id][relative_chunk_idx]
                         )
@@ -3415,6 +3431,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         request_configs = kwargs.get("request_configs")
         kv_group = kwargs.get("kv_group", 0)
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
         req_id = kwargs.get("req_id", "unspecified")
         phase = kwargs.get("shared_cpu_phase", "sparse_decode_bootstrap")
         perf_enabled = cold_start_perf_enabled()
@@ -3460,7 +3477,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 ends = list(cached_ends) + suffix_ends
                 keys_layer_major = [
                     list(cached_keys[layer_id]) + suffix_keys[layer_id]
-                    for layer_id in range(self.num_layers)
+                    for layer_id in range(num_layers)
                 ]
             else:
                 starts, ends, keys = [], [], []
@@ -3473,7 +3490,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     assert isinstance(key, CacheEngineKey)
                     starts.append(start)
                     ends.append(end)
-                    keys.append(key.split_layers(self.num_layers))
+                    keys.append(key.split_layers(num_layers))
                 keys_layer_major = (
                     [list(row) for row in zip(*keys, strict=False)]
                     if keys
@@ -3488,7 +3505,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 req_id=req_id,
                 phase=phase,
                 kv_group=kv_group,
-                layers=self.num_layers,
+                layers=num_layers,
                 chunks=required_chunks,
                 rank=self.metadata.worker_id,
                 passive=True,
@@ -3496,6 +3513,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_prefix_chunks = self._cached_sparse_prefix_chunks(
             cached_tensors,
             cached_memory_objs,
+            kv_group=kv_group,
         )
         if cached_prefix_chunks > required_chunks:
             raise ValueError(
@@ -3509,7 +3527,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             if values is not None
         }
         if cached_keys is not None:
-            if cached_keys and len(cached_keys) != self.num_layers:
+            if cached_keys and len(cached_keys) != num_layers:
                 raise ValueError("Sparse passive cached key metadata is incomplete.")
             metadata_counts.update(len(layer) for layer in cached_keys)
         if len(metadata_counts) > 1:
@@ -3533,7 +3551,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     or any(
                         cached_keys[layer_id][chunk_index]
                         != keys_layer_major[layer_id][chunk_index]
-                        for layer_id in range(self.num_layers)
+                        for layer_id in range(num_layers)
                     )
                 ):
                     raise ValueError(
@@ -3542,7 +3560,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
         cached_handle_chunks = self._uniform_layer_cache_chunks(
             cached_shared_handles,
-            self.num_layers,
+            num_layers,
             "passive shared handle cache",
         )
         if cached_handle_chunks != cached_prefix_chunks:
@@ -3589,7 +3607,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         defer_finish = False
 
         try:
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 sparse_request = yield ret_mask
                 (
                     sparse_payload,
@@ -3672,9 +3690,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                         if cached_keys is not None:
                             if not cached_keys:
                                 cached_keys.extend(
-                                    [] for _ in range(self.num_layers)
+                                    [] for _ in range(num_layers)
                                 )
-                            for cache_layer_id in range(self.num_layers):
+                            for cache_layer_id in range(num_layers):
                                 cached_keys[cache_layer_id].extend(
                                     keys_layer_major[cache_layer_id][
                                         cached_metadata_chunks:
@@ -3765,6 +3783,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_tensors,
                                 cached_chunk_dev_ptrs,
                                 cached_chunk_ptrs_npu,
+                                num_layers=num_layers,
                             )
                     except Exception:
                         for mem_obj in mem_objs_layer:
@@ -3779,6 +3798,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         handles,
                         cached_shared_handles,
                         cached_prefix_chunks,
+                        kv_group=kv_group,
                     )
                     if perf_enabled:
                         cold_start_perf_log(
@@ -3873,7 +3893,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         kv_group=kv_group,
                         rank=self.metadata.worker_id,
                         physical_pages=len(compact_pages),
-                        logical_entries=missing_chunks * self.num_layers,
+                        logical_entries=missing_chunks * num_layers,
                         legacy_tail_objects=legacy_tail_objects,
                         page_view_build_ms=round(page_view_build_s * 1000, 3),
                         pointer_seal_ms=pointer_seal_ms,
@@ -3887,7 +3907,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     req_id=req_id,
                     phase=phase,
                     request_ordinal=request_ordinal,
-                    layer_id=self.num_layers,
+                    layer_id=num_layers,
                     kv_group=kv_group,
                 )
                 self._validate_shared_layerwise_envelope(
@@ -3895,7 +3915,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     req_id=req_id,
                     phase=phase,
                     request_ordinal=request_ordinal,
-                    layer_id=self.num_layers,
+                    layer_id=num_layers,
                     kv_group=kv_group,
                 )
                 if (
@@ -3921,7 +3941,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         req_id=req_id,
                         phase=phase,
                         request_ordinal=request_ordinal,
-                        layer_id=self.num_layers,
+                        layer_id=num_layers,
                         kv_group=kv_group,
                     )
                 except BaseException:
@@ -4056,6 +4076,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
         if shared_sparse_retrieve:
             self._ensure_layerwise_connector_layout(**kwargs)
+        # Authoritative per-group transfer cardinality (GLM-5.2: 79 latent /
+        # 22 indexer), fail-closed against the per-group kvcaches list.
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
 
         mem_obj_consumer = None
         num_tokens = len(tokens)
@@ -4078,7 +4101,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             and self._has_retrieve_data_cache(
                 initial_cached_tensors,
                 initial_cached_memory_objs,
-                self.num_layers,
+                num_layers,
             )
         )
         if has_shared_cached_retrieve:
@@ -4118,6 +4141,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_prefix_chunks = self._cached_sparse_prefix_chunks(
             cached_tensors,
             cached_memory_objs,
+            kv_group=kv_group,
         )
 
         metadata_started = cold_start_perf_now() if perf_enabled else 0.0
@@ -4157,12 +4181,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
         cached_tensors_cover = self._retrieve_data_cache_covers(
             cached_tensors,
-            self.num_layers,
+            num_layers,
             required_chunks,
         )
         cached_memory_objs_cover = self._retrieve_data_cache_covers(
             cached_memory_objs,
-            self.num_layers,
+            num_layers,
             required_chunks,
         )
         use_cached_retrieve = cached_tensors_cover or cached_memory_objs_cover
@@ -4175,7 +4199,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         if shared_sparse_retrieve:
             cached_handle_chunks = self._uniform_layer_cache_chunks(
                 cached_shared_handles,
-                self.num_layers,
+                num_layers,
                 "shared handle cache",
             )
             if cached_handle_chunks > cached_prefix_chunks:
@@ -4205,10 +4229,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                 kwargs["cached_retrieve_location"] = location
 
         if not retrieve_keys:
-            retrieve_keys = [[] for _ in range(self.num_layers)]
-        elif len(retrieve_keys) < self.num_layers:
+            retrieve_keys = [[] for _ in range(num_layers)]
+        elif len(retrieve_keys) < num_layers:
             retrieve_keys.extend(
-                [] for _ in range(self.num_layers - len(retrieve_keys))
+                [] for _ in range(num_layers - len(retrieve_keys))
             )
 
         assert_layerwise_gpu_connector(self.gpu_connector)
@@ -4230,7 +4254,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             cached_memory_objs
             if cached_memory_objs_cover
             and cached_memory_objs is not None
-            and len(cached_memory_objs) == self.num_layers
+            and len(cached_memory_objs) == num_layers
             else None
         )
         shared_chunk_locations_layer_major: list[list[str]] = []
@@ -4337,7 +4361,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         remote_layers_per_batch = max(
             1,
             min(
-                self.num_layers,
+                num_layers,
                 int(
                     self._get_shared_config_value(
                         "shared_cpu_remote_layers_per_batch",
@@ -4347,7 +4371,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             ),
         )
         if mooncake_page_layout_enabled(self.config):
-            remote_layers_per_batch = self.num_layers
+            remote_layers_per_batch = num_layers
         if (
             shared_sparse_retrieve
             and not use_cached_retrieve
@@ -4795,7 +4819,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 "MemoryObjs."
                             )
                         compact_publish_mem_objs = []
-                        for layer_id in range(self.num_layers):
+                        for layer_id in range(num_layers):
                             publish_mem_objs = cached_memory_objs[layer_id][
                                 cached_handle_chunks:
                             ]
@@ -4815,6 +4839,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 [None] * len(publish_mem_objs),
                                 cached_shared_handles,
                                 cached_handle_chunks,
+                                kv_group=kv_group,
                             )
                         self._fence_shared_cpu_store_publication()
             except Exception as exc:
@@ -4965,7 +4990,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             "shared_cpu_phase", "sparse_decode_bootstrap"
                         ),
                         request_ordinal=request_ordinal,
-                        layer_id=self.num_layers,
+                        layer_id=num_layers,
                         kv_group=kv_group,
                         message="Compact shared batch failed before final commit.",
                         details={"error": str(error)},
@@ -4979,7 +5004,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         defer_finish = False
         try:
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 sparse_request = yield ret_mask
                 (
                     sparse_payload,
@@ -5030,6 +5055,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_tensors,
                                 cached_chunk_dev_ptrs,
                                 cached_chunk_ptrs_npu,
+                                num_layers=num_layers,
                             )
                     elif mem_objs_layer is None:
                         mem_objs_layer = []
@@ -5114,6 +5140,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 handles,
                                 cached_shared_handles,
                                 cached_handle_chunks,
+                                kv_group=kv_group,
                             )
                         envelope = SharedHandleEnvelope(
                             request_id=kwargs.get("req_id", "unspecified"),
@@ -5243,7 +5270,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             "shared_cpu_phase", "sparse_decode_bootstrap"
                         ),
                         request_ordinal=request_ordinal,
-                        layer_id=self.num_layers,
+                        layer_id=num_layers,
                         kv_group=kv_group,
                         status="skipped",
                         generation=self.shared_cpu_cache_generation,
