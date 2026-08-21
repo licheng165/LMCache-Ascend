@@ -1910,6 +1910,85 @@ class TestRetrieverPairAdvancement:
         )
         assert fake.current_layer == 1
 
+    def test_sparse_two_group_indexer_advances_only_physical_layers(self):
+        """Consumer latent waits must not consume the 22-row indexer stream."""
+        from lmcache.integration.vllm.vllm_v1_adapter import (
+            LMCacheConnectorMetadata,
+        )
+
+        producer_layers = (0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38,
+                           42, 46, 50, 54, 58, 62, 66, 70, 74, 78)
+        latent_sends = []
+        indexer_sends = []
+
+        def _retriever(sends, count):
+            for layer_id in range(count):
+                payload = yield None
+                sends.append((layer_id, payload))
+            yield None
+
+        latent_retriever = _retriever(latent_sends, 79)
+        indexer_retriever = _retriever(indexer_sends, 22)
+        next(latent_retriever)
+        next(indexer_retriever)
+        request = SimpleNamespace(
+            req_id="r1",
+            load_spec=SimpleNamespace(can_load=True),
+            is_sparse_decode=True,
+        )
+        meta = LMCacheConnectorMetadata(requests=[request])
+        fake = SimpleNamespace(
+            config=SimpleNamespace(dsa_two_groups=True),
+            _indexer_layer_names=[
+                f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+                for layer_id in producer_layers
+            ],
+            layerwise_retrievers=[(latent_retriever, indexer_retriever)],
+            _layerwise_retriever_is_sparse=[True],
+            _layerwise_requests=[request],
+            _layerwise_sparse_req_ids=["r1"],
+            _layerwise_sparse_shared_ordered=[False],
+            _layerwise_sparse_indexer_sent_layers=set(),
+            _layerwise_waited_groups=set(),
+            _layerwise_required_wait_groups_cache=None,
+            current_layer=0,
+            num_layers=79,
+            _parent=SimpleNamespace(_get_connector_metadata=lambda: meta),
+            _finalize_worker_retrieve_state_from_metadata=lambda _: None,
+            _record_sparse_retrieve_stats=lambda *_args: None,
+            _abort_layerwise_retrieve_step=lambda *_args: None,
+            _drain_layerwise_retrievers=lambda *_args, **_kwargs: None,
+            _cold_perf_dense_load_started={},
+            _cold_perf_load_started={},
+        )
+        fake = _bind_real(
+            fake,
+            "_is_dsa_two_groups",
+            "_is_indexer_layer_wait",
+            "_layerwise_wait_group",
+            "_layerwise_required_wait_groups",
+            "_layerwise_wait_should_advance",
+            "_layerwise_layer_id_from_name",
+            "_layerwise_has_indexer_model_layer",
+            "_sparse_retrieve_state_guard",
+        )
+
+        for layer_id in range(79):
+            if layer_id in producer_layers:
+                _adapter_method("wait_for_layer_load")(
+                    fake,
+                    layer_name=(
+                        f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+                    ),
+                )
+            _adapter_method("wait_for_layer_load")(
+                fake,
+                layer_name=f"model.layers.{layer_id}.self_attn.attn",
+            )
+
+        assert len(latent_sends) == 79
+        assert len(indexer_sends) == 22
+
 
 # ---------------------------------------------------------------------------
 # Integration: mimic vLLM worker call sequence against the adapter
