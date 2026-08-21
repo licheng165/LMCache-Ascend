@@ -3452,7 +3452,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             The group's layer count, or None when the group layout has not
             been initialized yet (callers fall back to legacy resolution).
         """
-        layout = self._group_layouts.get(kv_group)
+        layouts = getattr(self, "_group_layouts", None)
+        if not layouts:
+            return None
+        layout = layouts.get(kv_group)
         if layout is None or layout.num_layers <= 0:
             return None
         return layout.num_layers
@@ -3467,7 +3470,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             The group-local layer index tuple, or None when the group layout
             has not been initialized yet.
         """
-        layout = self._group_layouts.get(kv_group)
+        layouts = getattr(self, "_group_layouts", None)
+        if not layouts:
+            return None
+        layout = layouts.get(kv_group)
         if layout is None or not layout.layer_indices:
             return None
         return layout.layer_indices
@@ -3480,7 +3486,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layout has not been initialized.
         """
         if kv_group is None:
-            kv_group = self._current_kv_group
+            kv_group = getattr(self, "_current_kv_group", 0)
         group_layers = self.get_num_layers(kv_group)
         if group_layers is not None:
             return group_layers

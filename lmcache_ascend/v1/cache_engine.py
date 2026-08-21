@@ -2366,7 +2366,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             ValueError: If the connector layout and the engine-level group
                 cardinality disagree.
         """
-        get_num_layers = getattr(self.gpu_connector, "get_num_layers", None)
+        # getattr keeps lightweight/test engine instances (built via
+        # __new__ with a partial attribute set) on the engine-level
+        # resolution.
+        get_num_layers = getattr(
+            getattr(self, "gpu_connector", None), "get_num_layers", None
+        )
         connector_layers = (
             get_num_layers(kv_group) if callable(get_num_layers) else None
         )

@@ -498,6 +498,9 @@ class TestAscendStoreLayerCompletion:
         engine.is_healthy.return_value = True
         engine.is_frozen.return_value = False
         engine.num_layers = 1
+        # Per-group cardinality resolution: single-layer mock groups.
+        engine._num_layers_for_kv_group.return_value = 1
+        engine._num_transfer_layers_for_call.return_value = 1
         engine._get_req_id.return_value = "test"
         engine.stats_monitor.on_store_request.return_value = "monitor"
         engine.config.extra_config = {}
