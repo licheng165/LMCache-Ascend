@@ -2937,11 +2937,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             request_id=str(kwargs.get("req_id", "unspecified")),
             kv_group=int(kwargs.get("kv_group", 0) or 0),
         )
+        kv_group = store_result.kv_group
 
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
-            for layer_id in range(self.num_layers):
+            for _ in range(self._num_layers_for_kv_group(kv_group)):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
             yield store_result
@@ -2954,7 +2955,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             logger.debug(
                 "Passive rank (save_only_first_rank), skipping store_layer"
             )
-            for layer_id in range(self.num_layers):
+            for _ in range(self._num_layers_for_kv_group(kv_group)):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
             yield store_result
@@ -2991,7 +2992,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 num_to_store_tokens,
             )
             # Still need to yield to avoid StopIteration
-            for layer_id in range(self.num_layers):
+            for layer_id in range(self._num_layers_for_kv_group(kv_group)):
                 yield
             yield store_result
             return
@@ -3017,10 +3018,15 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         # Ensure the connector's MLA/DSA layout is detected before allocating
         # chunks -- get_shape(num_tokens) below depends on kv_lora_rank etc.
+        # This also establishes the connector's per-group layout cardinality
+        # used by _num_transfer_layers_for_call below.
         self._ensure_layerwise_connector_layout(**kwargs)
 
+        # Authoritative per-group transfer cardinality (GLM-5.2: 79 latent /
+        # 22 indexer). Fail-closes against the per-group kvcaches list.
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
+
         prev_key = 0
-        kv_group = kwargs.get("kv_group", 0)
         kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
@@ -3029,7 +3035,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+            keys_multi_layer = key.split_layers(num_layers)
             if self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
                 req_id=req_id,
@@ -3059,7 +3065,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
-                batch_size=self.num_layers,
+                batch_size=num_layers,
                 fmt=memory_format,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
@@ -3072,7 +3078,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 store_complete = False
                 break
 
-            if len(memory_objs_multi_layer) != self.num_layers:
+            if len(memory_objs_multi_layer) != num_layers:
                 logger.error(
                     "Layerwise store allocation returned wrong layer count: "
                     "req_id=%s kv_group=%s chunk=[%d,%d) shape=%s dtype=%s "
@@ -3085,13 +3091,13 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_dtype,
                     memory_format,
                     len(memory_objs_multi_layer),
-                    self.num_layers,
+                    num_layers,
                     kwargs.get("decode_window_save"),
                 )
                 raise RuntimeError(
                     "Layerwise store allocation layer count mismatch: "
                     f"got {len(memory_objs_multi_layer)}, "
-                    f"expected {self.num_layers}"
+                    f"expected {num_layers}"
                 )
 
             starts.append(start)
@@ -3172,7 +3178,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
             keys = [list(row) for row in zip(*keys, strict=False)]
-            if len(memory_objs) != self.num_layers or len(keys) != self.num_layers:
+            if len(memory_objs) != num_layers or len(keys) != num_layers:
                 logger.error(
                     "Layerwise store transpose produced wrong layer count: "
                     "req_id=%s kv_group=%s memory_layers=%d key_layers=%d "
@@ -3182,7 +3188,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     kv_group,
                     len(memory_objs),
                     len(keys),
-                    self.num_layers,
+                    num_layers,
                     len(starts),
                     starts,
                     ends,
@@ -3191,7 +3197,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 raise RuntimeError(
                     "Layerwise store transpose layer count mismatch: "
                     f"memory_layers={len(memory_objs)}, key_layers={len(keys)}, "
-                    f"expected={self.num_layers}"
+                    f"expected={num_layers}"
                 )
             pending_store_release = {
                 id(mem_obj): mem_obj
@@ -3269,7 +3275,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     and all_chunks_publishable
                 )
                 if use_group_store:
-                    for _ in range(self.num_layers):
+                    for _ in range(num_layers):
                         yield
                     host_pointer_rows, layer_chunk_ptrs_npu = group_store(
                         memory_objs, starts, ends, **kwargs
@@ -3283,7 +3289,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         layer_chunk_ptrs_npu,
                     )
                     if not page_first_store:
-                        for layer_id in range(self.num_layers):
+                        for layer_id in range(num_layers):
                             required_futures = self.storage_manager.batched_put(
                                 keys[layer_id],
                                 memory_objs[layer_id],
@@ -3297,7 +3303,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                         memory_objs, starts, ends, **kwargs
                     )
                     next(mem_obj_generator)
-                    for layer_id in range(self.num_layers):
+                    for layer_id in range(num_layers):
                         yield
                         next(mem_obj_generator)
                         self._append_layer_store_tensors(
@@ -3364,7 +3370,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
