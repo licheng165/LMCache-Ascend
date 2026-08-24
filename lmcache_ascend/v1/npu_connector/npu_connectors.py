@@ -1718,6 +1718,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        kv_group: int,
     ) -> None:
         """Atomically refresh every layer pointer row with one H2D copy."""
         if not new_sources_by_layer:
@@ -1725,11 +1727,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # The caller passes exactly this group's layer rows; use that length
         # instead of the last-wins mirrored instance count.
         num_layers = len(new_sources_by_layer)
-        if num_layers != self._expected_group_layers(self._current_kv_group):
+        expected_layers = self._expected_group_layers(kv_group)
+        if num_layers != expected_layers:
             raise ValueError(
                 "Sparse group pointer append must cover every layer: "
                 f"layers={num_layers}, "
-                f"expected={self._expected_group_layers(self._current_kv_group)}"
+                f"expected={expected_layers}, kv_group={kv_group}"
             )
         suffix_counts = {
             len(sources.pages) + len(sources.suffix)

@@ -1511,9 +1511,10 @@ def test_sparse_passive_reuses_one_merged_page(
             yield
 
         def append_sparse_chunk_ptr_cache_for_layers(
-            self, sources, host_ptrs, npu_ptrs
+            self, sources, host_ptrs, npu_ptrs, *, kv_group
         ):
             self.sources = sources
+            self.append_kv_group = kv_group
             host_ptrs.extend(([11], [22]))
             npu_ptrs.extend((torch.tensor([11]), torch.tensor([22])))
 
@@ -1560,6 +1561,7 @@ def test_sparse_passive_reuses_one_merged_page(
             isinstance(source, LayerPageSource)
             for source in engine.gpu_connector.sources
         )
+        assert engine.gpu_connector.append_kv_group == 0
         assert cached_memory_objs == [[page], [page]]
         assert cached_chunk_dev_ptrs == [[11], [22]]
         assert [row.tolist() for row in cached_chunk_ptrs_npu] == [[11], [22]]
@@ -2795,8 +2797,8 @@ def test_append_retrieve_group_accepts_empty_prefix():
     engine.num_layers = 2
     calls = []
 
-    def append(sources, host_ptrs, npu_ptrs):
-        calls.append(sources)
+    def append(sources, host_ptrs, npu_ptrs, *, kv_group):
+        calls.append((sources, kv_group))
         host_ptrs.extend(([11], [22]))
         npu_ptrs.extend(
             (
@@ -2823,9 +2825,11 @@ def test_append_retrieve_group_accepts_empty_prefix():
         cached_tensors,
         cached_host_ptrs,
         cached_npu_ptrs,
+        kv_group=0,
     )
 
     assert len(calls) == 1
+    assert calls[0][1] == 0
     assert cached_memory_objs == new_objs
     assert cached_host_ptrs == [[11], [22]]
     assert [row.tolist() for row in cached_npu_ptrs] == [[11], [22]]
@@ -2836,7 +2840,8 @@ def test_append_retrieve_group_preserves_layer_page_sources():
     engine.num_layers = 2
     sources = []
 
-    def append(new_sources, host_ptrs, npu_ptrs):
+    def append(new_sources, host_ptrs, npu_ptrs, *, kv_group):
+        assert kv_group == 0
         sources.extend(new_sources)
         host_ptrs[:] = [[11], [22]]
         npu_ptrs[:] = [
@@ -2861,6 +2866,7 @@ def test_append_retrieve_group_preserves_layer_page_sources():
         [],
         [],
         [None, None],
+        kv_group=0,
     )
 
     assert sources == page_sources
@@ -2897,6 +2903,7 @@ def test_append_retrieve_group_rejects_incomplete_prefix_before_mutation():
             cached_tensors,
             cached_host_ptrs,
             cached_npu_ptrs,
+            kv_group=0,
         )
 
     assert calls == []
@@ -2934,6 +2941,7 @@ def test_append_retrieve_group_rejects_wrong_outer_layer_count(layer_count):
             cached_tensors,
             cached_host_ptrs,
             cached_npu_ptrs,
+            kv_group=0,
         )
 
     assert calls == []

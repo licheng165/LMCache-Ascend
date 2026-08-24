@@ -1935,6 +1935,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
+        *,
+        kv_group: int,
     ) -> None:
         """Publish an all-layer retained source after one pointer-table copy."""
         group_append = getattr(
@@ -2037,6 +2039,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             mem_objs_by_layer if pointer_first else tensors_by_layer,
             cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu,
+            kv_group=kv_group,
         )
         if cached_memory_objs is not None:
             if not cached_memory_objs:
@@ -3884,6 +3887,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                    kv_group=kv_group,
                 )
                 if pointer_started:
                     pointer_seal_ms = round(
@@ -4810,6 +4814,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                    kv_group=kv_group,
                 )
                 group_cache_prepared = True
                 if publish_shared_handles:
