@@ -674,6 +674,7 @@ def test_sparse_window_store_cache_publishes_only_full_chunks() -> None:
         memory_objs,
         cached_tensors,
         cache_chunk_indices=[0],
+        kv_group=0,
     )
 
     assert cached_starts == [0]
@@ -1825,16 +1826,27 @@ class TestRetrieverPairAdvancement:
     @staticmethod
     def _bind_wait_protocol(fake, dsa_two_groups):
         fake.config = SimpleNamespace(dsa_two_groups=dsa_two_groups)
-        fake._indexer_layer_names = []
+        fake._indexer_layer_names = (
+            [
+                f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+                for layer_id in range(fake.num_layers)
+            ]
+            if dsa_two_groups
+            else []
+        )
         fake._layerwise_waited_groups = set()
-        fake._layerwise_required_wait_groups_cache = None
+        fake._record_sparse_retrieve_stats = lambda *_args: None
+        fake._abort_layerwise_retrieve_step = lambda *_args: None
         return _bind_real(
             fake,
             "_is_dsa_two_groups",
             "_is_indexer_layer_wait",
             "_layerwise_wait_group",
+            "_layerwise_layer_id_from_name",
+            "_layerwise_has_indexer_model_layer",
             "_layerwise_required_wait_groups",
             "_layerwise_wait_should_advance",
+            "_sparse_retrieve_state_guard",
         )
 
     def test_prefix_advances_both_retrievers(self):
@@ -1869,9 +1881,13 @@ class TestRetrieverPairAdvancement:
             ),
             dsa_two_groups=True,
         )
-        _adapter_method("wait_for_layer_load")(fake, layer_name="layer.0")
+        _adapter_method("wait_for_layer_load")(
+            fake, layer_name="model.layers.0.self_attn.attn"
+        )
         assert fake.current_layer == 0
-        _adapter_method("wait_for_layer_load")(fake, layer_name="indexer.0")
+        _adapter_method("wait_for_layer_load")(
+            fake, layer_name="model.layers.0.self_attn.indexer.k_cache"
+        )
         assert fake.current_layer == 1
 
     def test_sparse_advances_primary_only(self):
@@ -1950,7 +1966,6 @@ class TestRetrieverPairAdvancement:
             _layerwise_sparse_shared_ordered=[False],
             _layerwise_sparse_indexer_sent_layers=set(),
             _layerwise_waited_groups=set(),
-            _layerwise_required_wait_groups_cache=None,
             current_layer=0,
             num_layers=79,
             _parent=SimpleNamespace(_get_connector_metadata=lambda: meta),
@@ -2174,7 +2189,6 @@ def _make_fake_adapter(num_layers=2, dsa_two_groups=True):
         _layerwise_sparse_req_ids=[],
         _layerwise_waited_groups=set(),
         _layerwise_sparse_indexer_sent_layers=set(),
-        _layerwise_required_wait_groups_cache=None,
         _decode_window_save_completed_groups=set(),
         _decode_window_save_expected_start={},
         _completed_decode_window_saves={},

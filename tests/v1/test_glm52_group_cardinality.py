@@ -5,8 +5,8 @@ Ascend two-group layerwise paths.
 Covers the design contract:
 - _GroupLayout.num_layers/layer_indices established from the registered group
   caches at layout initialization (79 latent / 22 indexer).
-- Connector get_num_layers/get_layer_indices/_expected_group_layers with the
-  legacy single-group fallback.
+- Connector get_num_layers/get_layer_indices/_expected_group_layers with
+  fail-closed DSA and the legacy single-group fallback.
 - AscendLMCacheEngine._num_layers_for_kv_group: connector layout preferred,
   engine-level resolution fallback, disagreement fail-closed.
 - _num_transfer_layers_for_call fail-closes against the per-group kvcaches
@@ -29,6 +29,7 @@ from lmcache.utils import CacheEngineKey
 from lmcache_ascend.v1 import cache_engine as ascend_engine_module
 from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 from lmcache_ascend.v1.kv_format import KVCacheFormat
+from lmcache_ascend.v1.npu_connector import npu_connectors
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     _GroupLayout,
     VLLMPagedMemLayerwiseNPUConnector,
@@ -63,11 +64,14 @@ def _layout_for_format(kv_format: KVCacheFormat, num_layers: int) -> _GroupLayou
     return layout
 
 
-def _connector_with_layouts(layouts: dict[int, _GroupLayout]):
+def _connector_with_layouts(
+    layouts: dict[int, _GroupLayout], *, dsa_two_groups: bool = True
+):
     connector = SimpleNamespace()
     connector._group_layouts = layouts
     connector._current_kv_group = 0
     connector.num_layers = LATENT_LAYERS
+    connector.dsa_two_groups = dsa_two_groups
     connector.get_num_layers = (
         lambda kv_group=0: VLLMPagedMemLayerwiseNPUConnector.get_num_layers(
             connector, kv_group
@@ -117,9 +121,14 @@ class TestGroupLayoutCardinality:
         )
         assert connector.get_layer_indices(1) == tuple(range(22))
 
-    def test_expected_group_layers_falls_back_to_instance_count(self):
-        connector = _connector_with_layouts({})
+    def test_expected_group_layers_falls_back_for_single_group(self):
+        connector = _connector_with_layouts({}, dsa_two_groups=False)
         assert connector._expected_group_layers(1) == LATENT_LAYERS
+
+    def test_expected_group_layers_rejects_uninitialized_dsa_group(self):
+        connector = _connector_with_layouts({})
+        with pytest.raises(RuntimeError, match="layout is initialized"):
+            connector._expected_group_layers(1)
 
     def test_uninitialized_group_returns_none(self):
         connector = _connector_with_layouts({})
@@ -377,8 +386,42 @@ class TestAppendRetrieveLayerCache:
             None,
             None,
             num_layers=INDEXER_LAYERS,
+            kv_group=1,
         )
         assert len(cached_memory_objs) == INDEXER_LAYERS
+
+
+class TestAppendSparseChunkPtrCacheForLayer:
+    def test_explicit_group_ignores_stale_current_group(self, monkeypatch):
+        connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+        connector._group_layouts = {
+            0: _layout_for_format(KVCacheFormat.MLA_LATENT, LATENT_LAYERS),
+            1: _layout_for_format(KVCacheFormat.DSA_INDEX, INDEXER_LAYERS),
+        }
+        connector._current_kv_group = 0
+        connector.num_layers = LATENT_LAYERS
+        connector.kv_device = torch.device("cpu")
+        monkeypatch.setattr(
+            npu_connectors.lmc_ops,
+            "get_device_ptr",
+            lambda host_ptr: host_ptr + 1000,
+        )
+        cached_chunk_dev_ptrs: list[list[int]] = []
+        cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = []
+
+        connector.append_sparse_chunk_ptr_cache_for_layer(
+            5,
+            [SimpleNamespace(data_ptr=23)],
+            cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu,
+            kv_group=1,
+        )
+
+        assert connector._current_kv_group == 0
+        assert len(cached_chunk_dev_ptrs) == INDEXER_LAYERS
+        assert len(cached_chunk_ptrs_npu) == INDEXER_LAYERS
+        assert cached_chunk_dev_ptrs[5] == [1023]
+        assert cached_chunk_ptrs_npu[5].tolist() == [1023]
 
 
 def test_key_split_never_exceeds_group_cardinality():

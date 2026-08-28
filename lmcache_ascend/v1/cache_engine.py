@@ -1773,6 +1773,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_chunk_dev_ptrs: Optional[List] = None,
         cached_chunk_ptrs_npu: Optional[List] = None,
         cache_chunk_indices: Optional[List[int]] = None,
+        *,
+        kv_group: int,
     ) -> None:
         layer_memory_objs = memory_objs[layer_id]
         if cache_chunk_indices is not None:
@@ -1798,6 +1800,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     new_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                    kv_group=kv_group,
                 )
 
         if cached_tensors is None:
@@ -1814,11 +1817,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         cached_tensors: Optional[List],
         cached_chunk_dev_ptrs: Optional[List],
         cached_chunk_ptrs_npu: Optional[List],
-        num_layers: Optional[int] = None,
+        *,
+        num_layers: int,
+        kv_group: int,
     ) -> None:
         """Retain storage-get results for later retrieves in the same request."""
-        if num_layers is None:
-            num_layers = self.num_layers
         new_tensors: List[torch.Tensor] = []
         append_ptrs_fn = getattr(
             self.gpu_connector,
@@ -1843,6 +1846,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 mem_objs_layer,
                 cached_chunk_dev_ptrs,
                 cached_chunk_ptrs_npu,
+                kv_group=kv_group,
             )
         else:
             for chunk_index, mem_obj in enumerate(mem_objs_layer):
@@ -1864,6 +1868,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     new_tensors,
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
+                    kv_group=kv_group,
                 )
 
         if cached_memory_objs is not None:
@@ -2033,6 +2038,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     cached_chunk_dev_ptrs,
                     cached_chunk_ptrs_npu,
                     num_layers=len(owners_by_layer),
+                    kv_group=kv_group,
                 )
             return
         group_append(
@@ -2387,8 +2393,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "NPU connector group layout disagrees with the engine group "
                 f"cardinality: kv_group={kv_group} "
                 f"connector={int(connector_layers)} engine={engine_layers}. "
-                "Check the registered KV caches and the kv_group_layers "
-                "extra config."
+                "Check the registered KV caches, runtime metadata, and "
+                "explicit fallback configuration."
             )
         if connector_layers is not None:
             return int(connector_layers)
@@ -2427,8 +2433,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     f"{kv_group} resolved_layers={num_layers} "
                     f"kvcaches_layers={kvcaches_len}. The registered KV "
                     "caches for this group disagree with the resolved "
-                    "group cardinality (check kv_group_layers and the "
-                    "serving-engine group registration)."
+                    "group cardinality (check runtime metadata, explicit "
+                    "fallback configuration, and serving-engine registration)."
                 )
         return num_layers
 
@@ -3337,6 +3343,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                             cached_chunk_dev_ptrs,
                             cached_chunk_ptrs_npu,
                             cache_chunk_indices,
+                            kv_group=kv_group,
                         )
                         if page_first_store:
                             continue
@@ -3792,6 +3799,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_chunk_dev_ptrs,
                                 cached_chunk_ptrs_npu,
                                 num_layers=num_layers,
+                                kv_group=kv_group,
                             )
                     except Exception:
                         for mem_obj in mem_objs_layer:
@@ -5066,6 +5074,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                                 cached_chunk_dev_ptrs,
                                 cached_chunk_ptrs_npu,
                                 num_layers=num_layers,
+                                kv_group=kv_group,
                             )
                     elif mem_objs_layer is None:
                         mem_objs_layer = []

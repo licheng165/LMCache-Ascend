@@ -1656,6 +1656,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         new_sources: List[Union[torch.Tensor, MemoryObj]],
         cached_chunk_dev_ptrs: List[List[int]],
         cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+        *,
+        kv_group: int,
     ) -> None:
         """Resolve and append NPU device ptrs for newly retrieved chunks only."""
         if not new_sources:
@@ -1687,11 +1689,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 else torch.cat((existing, new_ptrs_npu), dim=0)
             )
 
-        # Group-local row count: interleaved per-group generators set
-        # _current_kv_group during their transfer steps, so the layout (or the
-        # mirrored instance count for legacy single-group) gives the right
-        # number of pointer rows for the group being appended.
-        num_layers = self._expected_group_layers(None)
+        # Use the call's group rather than mutable connector state because
+        # interleaved group generators can leave that state stale.
+        num_layers = self._expected_group_layers(kv_group)
         if not cached_chunk_dev_ptrs:
             cached_chunk_dev_ptrs.extend([] for _ in range(num_layers))
         while len(cached_chunk_dev_ptrs) <= layer_id:
@@ -1825,7 +1825,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         page_layers = len(rows)
         if any(
             len(source.pages) != len(pages)
-            or any(left is not right for left, right in zip(source.pages, pages))
+            or any(
+                left is not right
+                for left, right in zip(source.pages, pages, strict=True)
+            )
             for source in rows
             if isinstance(source, LayerPageSource)
         ):
@@ -3493,6 +3496,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         group_layers = self.get_num_layers(kv_group)
         if group_layers is not None:
             return group_layers
+        if self.dsa_two_groups:
+            raise RuntimeError(
+                "DSA transfer cannot resolve layer cardinality before the "
+                f"kv_group={kv_group} layout is initialized"
+            )
         return self.num_layers
 
     def set_layerwise_staging_concurrency(self, n: int) -> None:
@@ -4115,7 +4123,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 cpu_tensors = (
                     [_layer_memory_tensor(source_objs[0], layer_id)]
                     if pointer_first
-                    else _layer_source_tensors(memory_objs_layer, layer_id, expected_fmt)
+                    else _layer_source_tensors(
+                        memory_objs_layer, layer_id, expected_fmt
+                    )
                 )
                 # The generator is resumed from vLLM's attention path; refresh the
                 # active compute stream per layer before ordering load -> compute.

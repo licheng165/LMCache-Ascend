@@ -18,6 +18,7 @@ import torch
 
 if TYPE_CHECKING:
     # Third Party
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -29,9 +30,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
-        super().__init__(vllm_config, role, parent)
+        super().__init__(
+            vllm_config,
+            role,
+            parent,
+            kv_cache_config=kv_cache_config,
+        )
         # LMCache-NPU initializes this field only for worker connectors;
         # EngineCore also constructs this implementation for the scheduler.
         self.use_layerwise = bool(

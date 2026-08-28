@@ -767,7 +767,10 @@ class SyntheticGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         new_sources: list[Any],
         cached_chunk_dev_ptrs: list[list[int]],
         cached_chunk_ptrs_npu: list[Optional[torch.Tensor]],
+        *,
+        kv_group: int,
     ) -> None:
+        _ = kv_group
         started = time.perf_counter()
         while len(cached_chunk_dev_ptrs) < self.num_layers:
             cached_chunk_dev_ptrs.append([])
