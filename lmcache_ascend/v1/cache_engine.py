@@ -53,6 +53,13 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.token_database import TokenDatabase
 import torch
 
+# First Party
+from lmcache_ascend.v1.dsa_kv_topology import (
+    DSAKVTopologyView,
+    validate_dsa_kv_topology,
+    validate_matching_dsa_kv_topologies,
+)
+
 logger = init_logger(__name__)
 
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
@@ -304,6 +311,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
     ):
+        dsa_two_groups = bool(getattr(config, "dsa_two_groups", False))
+        metadata_topology = getattr(metadata, "dsa_kv_topology", None)
+        connector_topology = getattr(gpu_connector, "dsa_kv_topology", None)
+        topology = metadata_topology or connector_topology
+        if dsa_two_groups and topology is not None:
+            validate_dsa_kv_topology(topology)
+            if metadata_topology is not None and connector_topology is not None:
+                validate_matching_dsa_kv_topologies(
+                    validate_dsa_kv_topology(metadata_topology),
+                    validate_dsa_kv_topology(connector_topology),
+                    expected_owner="LMCache metadata",
+                    actual_owner="NPU connector",
+                )
         super().__init__(
             config,
             metadata,
@@ -312,6 +332,10 @@ class AscendLMCacheEngine(LMCacheEngine):
             broadcast_fn,
             broadcast_object_fn,
         )
+        self.dsa_kv_topology = topology if dsa_two_groups else None
+        self._dsa_kv_topology_view: Optional[DSAKVTopologyView] = None
+        if topology is not None and dsa_two_groups:
+            self.cache_dsa_kv_topology(topology)
         self.is_store_async = self.config.store_async
         self._pending_sync_store_futures: set[Future] = set()
         self._require_store_completion = False
@@ -353,6 +377,68 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if self.kv_events_enabled and self.is_store_async:
             self.kv_events = ThreadSafeEventList()
+
+    def cache_dsa_kv_topology(self, topology: Any) -> None:
+        """Validate and cache the construction-path DSA topology descriptor."""
+        if not getattr(getattr(self, "config", None), "dsa_two_groups", False):
+            return
+        view = validate_dsa_kv_topology(topology)
+        current_view = getattr(self, "_dsa_kv_topology_view", None)
+        if current_view is not None:
+            validate_matching_dsa_kv_topologies(
+                current_view,
+                view,
+                expected_owner="LMCache-Ascend engine",
+                actual_owner="construction path",
+            )
+
+        metadata = getattr(self, "metadata", None)
+        metadata_topology = getattr(metadata, "dsa_kv_topology", None)
+        if metadata_topology is not None:
+            validate_matching_dsa_kv_topologies(
+                view,
+                validate_dsa_kv_topology(metadata_topology),
+                expected_owner="LMCache-Ascend engine",
+                actual_owner="LMCache metadata",
+            )
+        elif metadata is not None:
+            metadata.dsa_kv_topology = topology
+
+        runtime_counts = getattr(
+            metadata, "runtime_kv_group_layer_counts", None
+        )
+        if runtime_counts is not None and tuple(runtime_counts) != view.layer_counts:
+            raise ValueError(
+                "DSA KV topology layout mismatch with LMCache runtime group "
+                f"cardinality: descriptor={view.layer_counts} "
+                f"runtime={tuple(runtime_counts)}."
+            )
+
+        connector = getattr(self, "gpu_connector", None)
+        cache_on_connector = getattr(connector, "cache_dsa_kv_topology", None)
+        if callable(cache_on_connector):
+            cache_on_connector(topology)
+        else:
+            connector_topology = getattr(connector, "dsa_kv_topology", None)
+            if connector_topology is not None:
+                validate_matching_dsa_kv_topologies(
+                    view,
+                    validate_dsa_kv_topology(connector_topology),
+                    expected_owner="LMCache-Ascend engine",
+                    actual_owner="NPU connector",
+                )
+
+        first_install = current_view is None
+        self.dsa_kv_topology = topology
+        self._dsa_kv_topology_view = view
+        if first_install:
+            logger.info(
+                "LMCache-Ascend DSA KV topology: signature=%s "
+                "rows_by_group=%s executions=%d owner=engine",
+                view.signature,
+                list(view.layer_counts),
+                len(view.executions),
+            )
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:

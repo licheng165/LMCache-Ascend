@@ -16,6 +16,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 import torch
 
+# First Party
+from lmcache_ascend.v1.dsa_kv_topology import (
+    DSAKVTopologyView,
+    validate_dsa_kv_topology,
+    validate_matching_dsa_kv_topologies,
+)
+
 if TYPE_CHECKING:
     # Third Party
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -33,12 +40,26 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
+        self._vllm_dsa_kv_topology = getattr(
+            kv_cache_config, "dsa_kv_topology", None
+        )
+        self.dsa_kv_topology = self._vllm_dsa_kv_topology
+        self._dsa_kv_topology_view: Optional[DSAKVTopologyView] = None
         super().__init__(
             vllm_config,
             role,
             parent,
             kv_cache_config=kv_cache_config,
         )
+        if getattr(self.config, "dsa_two_groups", False):
+            metadata = getattr(self, "lmcache_engine_metadata", None)
+            topology = (
+                self._vllm_dsa_kv_topology
+                or self.dsa_kv_topology
+                or getattr(metadata, "dsa_kv_topology", None)
+            )
+            if topology is not None:
+                self._cache_dsa_kv_topology(topology)
         # LMCache-NPU initializes this field only for worker connectors;
         # EngineCore also constructs this implementation for the scheduler.
         self.use_layerwise = bool(
@@ -88,6 +109,131 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "Layerwise storing is not supported with async store"
             )
         logger.debug("store_async: %s", self.store_async)
+
+    def _derive_runtime_kv_group_layer_counts(
+        self,
+        dsa_two_groups: bool,
+        kv_cache_config: Optional["KVCacheConfig"],
+    ) -> Optional[tuple[int, ...]]:
+        """Use the canonical descriptor instead of inferring DSA group roles."""
+        if not dsa_two_groups:
+            return super()._derive_runtime_kv_group_layer_counts(
+                dsa_two_groups, kv_cache_config
+            )
+
+        topology = getattr(kv_cache_config, "dsa_kv_topology", None)
+        if topology is None:
+            topology = getattr(self, "dsa_kv_topology", None)
+        if topology is None:
+            # Compatibility for lightweight mocks and older vLLM builds.
+            return super()._derive_runtime_kv_group_layer_counts(
+                dsa_two_groups, kv_cache_config
+            )
+
+        view = validate_dsa_kv_topology(topology)
+        runtime_groups = getattr(kv_cache_config, "kv_cache_groups", None)
+        if runtime_groups is not None:
+            if len(runtime_groups) != 2:
+                raise ValueError(
+                    "DSA KV topology layout mismatch: KVCacheConfig has "
+                    f"{len(runtime_groups)} groups, expected 2."
+                )
+            for kv_group, (runtime_group, descriptor_rows) in enumerate(
+                zip(runtime_groups, view.rows_by_group, strict=True)
+            ):
+                runtime_names = tuple(runtime_group.layer_names)
+                descriptor_names = tuple(row[0] for row in descriptor_rows)
+                if (
+                    len(runtime_names) != len(descriptor_names)
+                    or set(runtime_names) != set(descriptor_names)
+                ):
+                    raise ValueError(
+                        "DSA KV topology layout mismatch with KVCacheConfig: "
+                        f"kv_group={kv_group} runtime_layers="
+                        f"{len(runtime_names)} descriptor_layers="
+                        f"{len(descriptor_names)}."
+                    )
+
+        self.dsa_kv_topology = topology
+        self._dsa_kv_topology_view = view
+        return view.layer_counts
+
+    def _cache_dsa_kv_topology(self, topology: Any) -> None:
+        """Cache one validated descriptor across adapter, metadata, and engine."""
+        view = validate_dsa_kv_topology(topology)
+        current_view = getattr(self, "_dsa_kv_topology_view", None)
+        if current_view is not None:
+            validate_matching_dsa_kv_topologies(
+                current_view,
+                view,
+                expected_owner="LMCache-Ascend adapter",
+                actual_owner="KVCacheConfig",
+            )
+
+        metadata = getattr(self, "lmcache_engine_metadata", None)
+        metadata_topology = getattr(metadata, "dsa_kv_topology", None)
+        if metadata_topology is not None:
+            validate_matching_dsa_kv_topologies(
+                view,
+                validate_dsa_kv_topology(metadata_topology),
+                expected_owner="KVCacheConfig",
+                actual_owner="LMCache metadata",
+            )
+        elif metadata is not None:
+            metadata.dsa_kv_topology = topology
+
+        engine = self.lmcache_engine
+        cache_on_engine = getattr(engine, "cache_dsa_kv_topology", None)
+        if callable(cache_on_engine):
+            cache_on_engine(topology)
+        elif engine is not None:
+            engine.dsa_kv_topology = topology
+
+        self.dsa_kv_topology = topology
+        self._dsa_kv_topology_view = view
+        logger.info(
+            "LMCache-Ascend DSA KV topology: signature=%s rows_by_group=%s "
+            "executions=%d owner=adapter",
+            view.signature,
+            list(view.layer_counts),
+            len(view.executions),
+        )
+
+    def _refresh_kvcaches_list(self) -> None:
+        """Order registered DSA caches by descriptor group-local rows."""
+        if not getattr(getattr(self, "config", None), "dsa_two_groups", False):
+            super()._refresh_kvcaches_list()
+            return
+        topology = getattr(self, "dsa_kv_topology", None)
+        if topology is None:
+            # Compatibility for tests and older serving engines without the ABI.
+            super()._refresh_kvcaches_list()
+            return
+
+        view = validate_dsa_kv_topology(topology)
+        descriptor_names = {
+            row[0] for group_rows in view.rows_by_group for row in group_rows
+        }
+        registered_names = set(self.kv_caches)
+        if registered_names != descriptor_names:
+            raise ValueError(
+                "DSA KV topology layout mismatch with registered KV caches: "
+                f"missing={sorted(descriptor_names - registered_names)} "
+                f"unexpected={sorted(registered_names - descriptor_names)}."
+            )
+
+        self._latent_layer_names = [row[0] for row in view.rows_by_group[0]]
+        self._indexer_layer_names = [row[0] for row in view.rows_by_group[1]]
+        self._latent_kvcaches = [
+            self.kv_caches[layer_name]
+            for layer_name in self._latent_layer_names
+        ]
+        self._indexer_kvcaches = [
+            self.kv_caches[layer_name]
+            for layer_name in self._indexer_layer_names
+        ]
+        self._kvcaches_list = self._latent_kvcaches
+        self._dsa_kv_topology_view = view
 
     def _direct_prefill_requests(self) -> Optional[list[ReqMeta]]:
         if (

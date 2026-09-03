@@ -33,6 +33,11 @@ from lmcache.v1.metadata import LMCacheMetadata
 import torch
 
 # First Party
+from lmcache_ascend.v1.dsa_kv_topology import (
+    DSAKVTopologyView,
+    validate_dsa_kv_topology,
+    validate_matching_dsa_kv_topologies,
+)
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_sparse_single_layer_kv_transfer,
@@ -1441,6 +1446,7 @@ class _GroupLayout:
         "num_layers",
         "layer_indices",
         "layout_signature",
+        "topology_signature",
     )
 
     def __init__(self) -> None:
@@ -1458,6 +1464,7 @@ class _GroupLayout:
         self.num_layers: int = 0
         self.layer_indices: tuple[int, ...] = ()
         self.layout_signature: Optional[str] = None
+        self.topology_signature: Optional[str] = None
 
 
 class _SparseDestinationPlan:
@@ -1531,6 +1538,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         # backward-compatible readers (benchmarks, logs, external callers).
         self._group_layouts: dict[int, _GroupLayout] = {}
         self._current_kv_group: int = 0
+        self.dsa_kv_topology = None
+        self._dsa_kv_topology_view: Optional[DSAKVTopologyView] = None
+        if self.dsa_two_groups and kwargs.get("dsa_kv_topology") is not None:
+            self.cache_dsa_kv_topology(kwargs["dsa_kv_topology"])
 
         # Mirrored attributes for the current group (updated by
         # _lazy_initialize_buffer). The layerwise hot paths snapshot values
@@ -3446,10 +3457,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     def get_num_layers(self, kv_group: int = 0) -> Optional[int]:
         """Return the authoritative layer count of a KV group.
 
-        The count comes from the registered group caches captured at layout
-        initialization (e.g. 79 for latent, 22 for indexer under
-        dsa_two_groups). This is stable across interleaved per-group calls,
-        unlike the mirrored ``self.num_layers``.
+        With a DSA topology descriptor, the count comes from its group rows
+        and registered caches are validated against it. Descriptor-free paths
+        retain the registered-cache count. This is stable across interleaved
+        per-group calls, unlike the mirrored ``self.num_layers``.
 
         Args:
             kv_group: The KV group index.
@@ -3483,6 +3494,101 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if layout is None or not layout.layer_indices:
             return None
         return layout.layer_indices
+
+    def cache_dsa_kv_topology(self, topology: Any) -> None:
+        """Validate and cache vLLM's immutable DSA topology descriptor."""
+        if not getattr(self, "dsa_two_groups", False):
+            return
+        view = validate_dsa_kv_topology(topology)
+        current_view = getattr(self, "_dsa_kv_topology_view", None)
+        if current_view is not None:
+            validate_matching_dsa_kv_topologies(
+                current_view,
+                view,
+                expected_owner="NPU connector",
+                actual_owner="construction path",
+            )
+
+        for kv_group, layout in getattr(self, "_group_layouts", {}).items():
+            self._apply_topology_group_layout(
+                kv_group,
+                layout,
+                actual_layers=layout.num_layers,
+                topology_view=view,
+            )
+
+        first_install = current_view is None
+        self.dsa_kv_topology = topology
+        self._dsa_kv_topology_view = view
+        if first_install:
+            logger.info(
+                "LMCache-Ascend DSA KV topology: signature=%s "
+                "rows_by_group=%s executions=%d owner=npu_connector",
+                view.signature,
+                list(view.layer_counts),
+                len(view.executions),
+            )
+
+    def _apply_topology_group_layout(
+        self,
+        kv_group: int,
+        layout: _GroupLayout,
+        *,
+        actual_layers: int,
+        topology_view: Optional[DSAKVTopologyView] = None,
+    ) -> None:
+        """Construct or validate one group layout from descriptor row ordinals."""
+        view = topology_view or getattr(self, "_dsa_kv_topology_view", None)
+        if view is None:
+            return
+        if kv_group not in (0, 1):
+            raise ValueError(
+                f"DSA KV topology has no layout for kv_group={kv_group}."
+            )
+        expected_layers = view.layer_counts[kv_group]
+        expected_indices = view.layer_indices(kv_group)
+        if actual_layers != expected_layers:
+            raise ValueError(
+                "DSA KV topology layout mismatch with registered KV caches: "
+                f"kv_group={kv_group} descriptor_layers={expected_layers} "
+                f"registered_layers={actual_layers}."
+            )
+        if layout.num_layers not in (0, expected_layers):
+            raise ValueError(
+                "DSA KV topology layout mismatch with cached NPU layout: "
+                f"kv_group={kv_group} descriptor_layers={expected_layers} "
+                f"layout_layers={layout.num_layers}."
+            )
+        if layout.layer_indices and layout.layer_indices != expected_indices:
+            raise ValueError(
+                "DSA KV topology layout mismatch with cached layer indices: "
+                f"kv_group={kv_group} descriptor={expected_indices} "
+                f"layout={layout.layer_indices}."
+            )
+        if (
+            layout.topology_signature is not None
+            and layout.topology_signature != view.signature
+        ):
+            raise ValueError(
+                "DSA KV topology signature mismatch with cached NPU layout: "
+                f"kv_group={kv_group} descriptor={view.signature} "
+                f"layout={layout.topology_signature}."
+            )
+        expected_format = (
+            KVCacheFormat.MLA_LATENT
+            if kv_group == 0
+            else KVCacheFormat.DSA_INDEX
+        )
+        if layout.kv_format not in (KVCacheFormat.UNDEFINED, expected_format):
+            raise ValueError(
+                "DSA KV topology layout mismatch with detected KV format: "
+                f"kv_group={kv_group} expected={expected_format.name} "
+                f"actual={layout.kv_format.name}."
+            )
+
+        layout.num_layers = expected_layers
+        layout.layer_indices = expected_indices
+        layout.topology_signature = view.signature
 
     def _expected_group_layers(self, kv_group: Optional[int]) -> int:
         """Resolve the per-group transfer row count for invariant checks.
@@ -3660,6 +3766,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
+        dsa_two_groups: bool = False,
+        dsa_kv_topology: Optional[Any] = None,
     ) -> "VLLMPagedMemLayerwiseNPUConnector":
         num_layers = metadata.kv_shape[0]
         chunk_size = metadata.kv_shape[2]
@@ -3677,6 +3785,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             use_mla=metadata.use_mla,
             layout_hints=layout_hints,
             max_staging_tokens=max_staging_tokens,
+            dsa_two_groups=dsa_two_groups,
+            dsa_kv_topology=dsa_kv_topology,
         )
 
     def _assign_group_gpu_allocator(
@@ -3741,13 +3851,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._reset_sparse_direct_layer_states()
             first_layer_cache = kv_caches[0]
 
-            # Authoritative per-group cardinality: the registered group caches
-            # are the runtime truth of how many layer rows this group
-            # transfers (GLM-5.2: latent=79, indexer=22). The mirrored
-            # instance self.num_layers is last-wins across interleaved group
-            # calls, so per-group readers must use layout.num_layers.
-            layout.num_layers = len(kv_caches)
-            layout.layer_indices = tuple(range(len(kv_caches)))
+            topology_view = getattr(self, "_dsa_kv_topology_view", None)
+            if topology_view is not None:
+                self._apply_topology_group_layout(
+                    kv_group,
+                    layout,
+                    actual_layers=len(kv_caches),
+                    topology_view=topology_view,
+                )
+            else:
+                # Compatibility for non-DSA and older descriptor-free paths.
+                layout.num_layers = len(kv_caches)
+                layout.layer_indices = tuple(range(len(kv_caches)))
 
             if layout.kv_format == KVCacheFormat.SEPARATE_KV:
                 key_tensor = first_layer_cache[0]
@@ -3866,6 +3981,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     payload,
                 )
             self._group_layouts[kv_group] = layout
+
+        topology_view = getattr(self, "_dsa_kv_topology_view", None)
+        if topology_view is not None:
+            self._apply_topology_group_layout(
+                kv_group,
+                layout,
+                actual_layers=len(kv_caches),
+                topology_view=topology_view,
+            )
 
         # Mirror into instance attributes for backward-compatible readers.
         self._mirror_layout(layout)

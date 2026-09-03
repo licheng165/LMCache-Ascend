@@ -57,15 +57,25 @@ def CreateNPUConnector(
             )
 
         if config.use_layerwise:
+            dsa_two_groups = bool(getattr(config, "dsa_two_groups", False))
+            dsa_kv_topology = getattr(metadata, "dsa_kv_topology", None)
             if config.enable_blending:
                 conn = VLLMBufferLayerwiseNPUConnector.from_metadata(
                     metadata, use_gpu, device, layout_hints=layout_hints
                 )
             else:
                 conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
-                    metadata, use_gpu, device, layout_hints=layout_hints
+                    metadata,
+                    use_gpu,
+                    device,
+                    layout_hints=layout_hints,
+                    dsa_two_groups=dsa_two_groups,
+                    dsa_kv_topology=dsa_kv_topology,
                 )
-            conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
+            conn.dsa_two_groups = dsa_two_groups
+            cache_topology = getattr(conn, "cache_dsa_kv_topology", None)
+            if dsa_kv_topology is not None and callable(cache_topology):
+                cache_topology(dsa_kv_topology)
             return conn
 
         if config.use_gpu_connector_v3:
