@@ -476,11 +476,16 @@ class AscendLMCacheEngine(LMCacheEngine):
         backend = LayerwisePrefillNPUWindowBackend(view, ops)
         self._layerwise_prefill_window_backend = backend
         logger.info(
-            "Layerwise-prefill NPU transfer-window backend ready: "
-            "topology_signature=%s rows_by_group=%s source_banks=%d",
+            "Layerwise-prefill P node: residency_mode=PREFILL_LAYERWISE "
+            "topology_signature=%s rows_by_group=%s source_banks=%d "
+            "connector_transfer_window=%s connector_sync_callbacks=%s "
+            "connector_indexer_persistence=%s",
             backend.topology_signature,
             list(view.layer_counts),
             ops.source_bank_count(),
+            backend.supports_transfer_window,
+            backend.supports_sync_callbacks,
+            backend.persists_indexer_group,
         )
         return backend
 
