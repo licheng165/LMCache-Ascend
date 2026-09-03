@@ -59,6 +59,9 @@ from lmcache_ascend.v1.dsa_kv_topology import (
     validate_dsa_kv_topology,
     validate_matching_dsa_kv_topologies,
 )
+from lmcache_ascend.v1.layerwise_prefill_window import (
+    LayerwisePrefillNPUWindowBackend,
+)
 
 logger = init_logger(__name__)
 
@@ -439,6 +442,47 @@ class AscendLMCacheEngine(LMCacheEngine):
                 list(view.layer_counts),
                 len(view.executions),
             )
+
+    @property
+    def layerwise_prefill_window_backend(
+        self,
+    ) -> Optional[LayerwisePrefillNPUWindowBackend]:
+        """Stage 4 transfer-window backend, gated on NPU connector support.
+
+        The generic LMCache connector consumes this attribute to freeze its
+        layerwise-prefill capabilities. It is only non-None when the engine
+        holds a validated DSA topology and the layerwise NPU connector
+        opted into the transfer-window device-ops contract, so any
+        unsupported deployment keeps the whole protocol disabled instead of
+        partially launching.
+        """
+        backend = getattr(self, "_layerwise_prefill_window_backend", None)
+        if backend is not None:
+            return backend
+        view = getattr(self, "_dsa_kv_topology_view", None)
+        if view is None:
+            return None
+        connector = getattr(self, "gpu_connector", None)
+        if connector is None:
+            return None
+        opt_in = getattr(connector, "supports_layerwise_prefill_window", None)
+        if not callable(opt_in) or opt_in() is not True:
+            return None
+        ops = getattr(connector, "layerwise_prefill_device_ops", None)
+        if ops is None or not callable(
+            getattr(ops, "submit_save", None)
+        ):
+            return None
+        backend = LayerwisePrefillNPUWindowBackend(view, ops)
+        self._layerwise_prefill_window_backend = backend
+        logger.info(
+            "Layerwise-prefill NPU transfer-window backend ready: "
+            "topology_signature=%s rows_by_group=%s source_banks=%d",
+            backend.topology_signature,
+            list(view.layer_counts),
+            ops.source_bank_count(),
+        )
+        return backend
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
