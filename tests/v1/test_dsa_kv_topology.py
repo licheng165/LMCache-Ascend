@@ -159,6 +159,80 @@ def test_provided_malformed_topology_fails_closed(mutate) -> None:
         )
 
 
+def _d_node_adapter(
+    monkeypatch,
+    *,
+    use_layerwise: bool = True,
+    enable_sparse_attention: bool = True,
+    supports_cold_compact: bool = True,
+    shrink: str = "2",
+    unbundle: str = "1",
+    two_groups: str = "1",
+    shared_pool: str = "1",
+) -> LMCacheAscendConnectorV1Impl:
+    adapter = object.__new__(LMCacheAscendConnectorV1Impl)
+    adapter.config = SimpleNamespace(
+        use_layerwise=use_layerwise,
+        enable_sparse_attention=enable_sparse_attention,
+    )
+    adapter.supports_dsa_cold_compact_load = lambda: supports_cold_compact
+    monkeypatch.setenv("VLLM_ASCEND_DSA_UNBUNDLE", unbundle)
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", two_groups)
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", shared_pool)
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", shrink)
+    return adapter
+
+
+def _d_node_vllm_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+    )
+
+
+def test_d_node_prerequisites_pass_when_closed_set_is_satisfied(monkeypatch) -> None:
+    adapter = _d_node_adapter(monkeypatch)
+
+    adapter._validate_sparse_decode_d_node_prerequisites(_d_node_vllm_config())
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"shrink": "0"}, "DSA_SHRINK_LATENT=2"),
+        ({"use_layerwise": False}, "use_layerwise=true"),
+        ({"enable_sparse_attention": False}, "enable_sparse_attention=true"),
+        ({"supports_cold_compact": False}, "supports_dsa_compact_external_load"),
+        ({"unbundle": "0"}, "DSA_UNBUNDLE=1"),
+    ],
+)
+def test_d_node_prerequisites_fail_closed_per_condition(
+    monkeypatch,
+    kwargs,
+    expected,
+) -> None:
+    adapter = _d_node_adapter(monkeypatch, **kwargs)
+
+    with pytest.raises(ValueError, match=expected):
+        adapter._validate_sparse_decode_d_node_prerequisites(
+            _d_node_vllm_config()
+        )
+
+
+def test_d_node_env_uses_strict_boolean_spelling(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", raising=False)
+    assert LMCacheAscendConnectorV1Impl._sparse_decode_d_node_requested() is False
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", " TrUe ")
+    assert LMCacheAscendConnectorV1Impl._sparse_decode_d_node_requested() is True
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "1")
+    with pytest.raises(ValueError, match="must be 'true' or 'false'"):
+        LMCacheAscendConnectorV1Impl._sparse_decode_d_node_requested()
+
+
 def test_group_layout_is_constructed_from_descriptor_cardinality() -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.dsa_two_groups = True

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -60,6 +61,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             )
             if topology is not None:
                 self._cache_dsa_kv_topology(topology)
+        if self._sparse_decode_d_node_requested():
+            self._validate_sparse_decode_d_node_prerequisites(vllm_config)
         # LMCache-NPU initializes this field only for worker connectors;
         # EngineCore also constructs this implementation for the scheduler.
         self.use_layerwise = bool(
@@ -109,6 +112,54 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 "Layerwise storing is not supported with async store"
             )
         logger.debug("store_async: %s", self.store_async)
+
+    @staticmethod
+    def _sparse_decode_d_node_requested() -> bool:
+        raw = os.environ.get("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "false")
+        normalized = raw.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+        raise ValueError(
+            "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE must be 'true' or 'false', "
+            f"got {raw!r}"
+        )
+
+    def _validate_sparse_decode_d_node_prerequisites(
+        self,
+        vllm_config: "VllmConfig",
+    ) -> None:
+        """Fail closed unless every D-node condition in the design holds."""
+        failures: list[str] = []
+        if os.environ.get("VLLM_ASCEND_DSA_UNBUNDLE") != "1":
+            failures.append("VLLM_ASCEND_DSA_UNBUNDLE=1")
+        if os.environ.get("VLLM_ASCEND_DSA_TWO_GROUPS") != "1":
+            failures.append("VLLM_ASCEND_DSA_TWO_GROUPS=1")
+        if os.environ.get("VLLM_ASCEND_DSA_SHARED_POOL") != "1":
+            failures.append("VLLM_ASCEND_DSA_SHARED_POOL=1")
+        if os.environ.get("VLLM_ASCEND_DSA_SHRINK_LATENT") != "2":
+            failures.append("VLLM_ASCEND_DSA_SHRINK_LATENT=2")
+        if not getattr(self.config, "use_layerwise", False):
+            failures.append("LMCache use_layerwise=true")
+        if not getattr(self.config, "enable_sparse_attention", False):
+            failures.append("LMCache enable_sparse_attention=true")
+        if not getattr(self, "supports_dsa_cold_compact_load", lambda: False)():
+            failures.append("connector supports_dsa_compact_external_load=true")
+        if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
+            failures.append("--no-enable-prefix-caching")
+        parallel = vllm_config.parallel_config
+        if getattr(parallel, "pipeline_parallel_size", 1) != 1:
+            failures.append("pipeline_parallel_size=1")
+        if getattr(parallel, "prefill_context_parallel_size", 1) != 1:
+            failures.append("prefill_context_parallel_size=1")
+        if getattr(parallel, "decode_context_parallel_size", 1) != 1:
+            failures.append("decode_context_parallel_size=1")
+        if failures:
+            raise ValueError(
+                "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires: "
+                + ", ".join(failures)
+            )
 
     def _derive_runtime_kv_group_layer_counts(
         self,
