@@ -1526,6 +1526,117 @@ def test_sparse_transfer_topk_preserves_shorter_inputs(
     assert limited_selected is selected
 
 
+def test_sparse_transfer_topk_preserves_dense_bootstrap(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "0")
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0")
+    monkeypatch.setattr(npu_connectors, "_SPARSE_TRANSFER_TOPK", 2)
+    connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
+    connector.num_layers = 1
+    connector.kv_device = torch.device("cpu")
+    connector.kvcaches = [(object(),)]
+    connector.load_stream_idx = 0
+    connector.load_stream_num = 1
+    connector.load_stream_list = [object()]
+    connector.lmcache_chunk_size = 256
+    connector._layerwise_sparse_idx_cache = None
+
+    class _Stream:
+        pass
+
+    class _Layout:
+        k_hidden_dims = 1
+        v_hidden_dims = 1
+        dsa_hidden_dims = 0
+        kv_format = type("_Fmt", (), {"value": 0})()
+        vllm_two_major = False
+        kv_device = torch.device("cpu")
+
+    layout = _Layout()
+    connector._group_layouts = {0: layout}
+    normal_calls = []
+    prepared_calls = []
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **kwargs: None)
+    monkeypatch.setattr(
+        connector,
+        "_lazy_initialize_buffer_with_staging",
+        lambda kvcaches, kv_group, init_staging: layout,
+    )
+    monkeypatch.setattr(connector, "_expected_group_layers", lambda kv_group: 1)
+    monkeypatch.setattr(connector, "_is_mla_dsa_format", lambda kv_group: False)
+    monkeypatch.setattr(connector, "_layerwise_token_major", lambda kv_group: False)
+    monkeypatch.setattr(
+        connector,
+        "_sparse_lmc_host_interleaved",
+        lambda kv_group: False,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_resolve_sparse_chunk_ptrs_npu",
+        lambda *args, **kwargs: torch.tensor([123], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_get_or_create_sparse_destination_plan",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_run_sparse_direct_kv_transfer_layer",
+        lambda **kwargs: normal_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_run_prepared_sparse_direct_kv_transfer_layer",
+        lambda **kwargs: prepared_calls.append(kwargs),
+    )
+
+    source = PreparedSparseSource(
+        layers=(
+            PreparedSparseSourceLayer(
+                tensors=(torch.zeros(4),),
+                chunk_ptrs_npu=torch.tensor([123], dtype=torch.int64),
+            ),
+        ),
+        total_tokens=4,
+    )
+
+    def run_transfer(*, prepared: bool, selected_token_idx):
+        kwargs = {
+            "kvcaches": [(object(),)],
+            "slot_mapping": torch.arange(4, dtype=torch.long),
+            "sync": False,
+            "kv_group": 0,
+        }
+        if prepared:
+            kwargs["prepared_sparse_source"] = source
+        else:
+            kwargs["cached_tensors"] = [[torch.zeros(4)]]
+            kwargs["lmcache_cached_tokens"] = 4
+        generator = connector.batched_to_gpu_head_token_wise(**kwargs)
+        next(generator)
+        payload = (
+            (selected_token_idx, 0)
+            if prepared
+            else ([], selected_token_idx, 0)
+        )
+        generator.send(payload)
+        generator.close()
+
+    for prepared, calls in ((False, normal_calls), (True, prepared_calls)):
+        run_transfer(prepared=prepared, selected_token_idx=None)
+        assert calls[-1]["selected_token_idx"].tolist() == [0, 1, 2, 3]
+        assert calls[-1]["slot_mapping_packed"].tolist() == [0, 1, 2, 3]
+
+        run_transfer(
+            prepared=prepared,
+            selected_token_idx=torch.arange(4, dtype=torch.int32),
+        )
+        assert calls[-1]["selected_token_idx"].tolist() == [0, 1]
+        assert calls[-1]["slot_mapping_packed"].tolist() == [0, 1]
+
+
 def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
     connector = object.__new__(VLLMPagedMemLayerwiseNPUConnector)
     connector.kv_device = torch.device("cpu")
