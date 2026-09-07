@@ -9,10 +9,12 @@ futures, shared-handle publication and every TP rank's acknowledgement finished.
 # Standard
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
+from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.pin_monitor import PinMonitor
@@ -24,6 +26,8 @@ from lmcache_ascend.v1.dsa_kv_topology import DSAKVTopologyView
 if TYPE_CHECKING:
     from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 
+logger = init_logger(__name__)
+
 
 class LayerwisePrefillFenceError(RuntimeError):
     """An uncompleted device transfer requires worker restart, not slab reuse."""
@@ -31,10 +35,14 @@ class LayerwisePrefillFenceError(RuntimeError):
 
 @dataclass
 class _RowPrefix:
+    """Request-owned, trusted manifest adopted after all-TP completion ACK."""
+
     starts: list[int]
     ends: list[int]
     keys: list[CacheEngineKey]
     objects: list[MemoryObj]
+    revision: int
+    slab_generation: int
 
 
 class LayerwisePrefillSyncBackend:
@@ -72,6 +80,12 @@ class LayerwisePrefillSyncBackend:
         self._failed = False
         self._unsafe_transfer = False
         self._quarantined: list[MemoryObj] = []
+        self._step_started = 0.0
+        self._bind_seconds = 0.0
+        self._load_seconds = 0.0
+        self._save_seconds = 0.0
+        self._reused_rows = 0
+        self._published_handles = 0
 
     @property
     def topology_signature(self) -> str:
@@ -98,6 +112,7 @@ class LayerwisePrefillSyncBackend:
         caches = {}
         slots = {}
         plans = {}
+        started = perf_counter()
         try:
             if self._bound or self._failed:
                 raise ValueError(
@@ -111,6 +126,23 @@ class LayerwisePrefillSyncBackend:
             )
             if len({req.request_id for req in frozen}) != len(frozen):
                 raise ValueError("Duplicate layerwise-prefill request binding")
+            if self._engine.metadata.is_first_rank():
+                logger.info(
+                    "[PREFILL_SYNC_STEP] event=begin step=%d requests=%d "
+                    "ranges=(request,generation,compute_start,compute_end,restore_end):%s",
+                    self._step + 1,
+                    len(frozen),
+                    [
+                        (
+                            req.request_id,
+                            req.allocation_generation,
+                            req.compute_start,
+                            req.compute_end,
+                            req.restore_end,
+                        )
+                        for req in frozen
+                    ],
+                )
             for group, rows in enumerate(self._view.rows_by_group):
                 for name, *_ in rows:
                     caches[name] = self._planes(kv_caches[name], group)
@@ -153,6 +185,13 @@ class LayerwisePrefillSyncBackend:
                     raise ValueError(
                         "Layerwise-prefill continuation changed its retained prefix"
                     )
+                if prior is not None and any(
+                    (req.request_id, prior.allocation_generation, group, row)
+                    not in self._prefixes
+                    for group, count in enumerate(self._view.layer_counts)
+                    for row in range(count)
+                ):
+                    raise ValueError("Missing retained layerwise-prefill manifest")
                 if (
                     prior is not None
                     and req.allocation_generation == prior.allocation_generation
@@ -242,29 +281,37 @@ class LayerwisePrefillSyncBackend:
         self._saved, self._ready = [0, 0], set()
         self._step += 1
         self._bound = True
+        self._step_started = started
+        self._bind_seconds = perf_counter() - started
+        self._load_seconds = self._save_seconds = 0.0
+        self._reused_rows = self._published_handles = 0
 
     def wait_for_load(self, metadata: Any) -> None:
         """Restore this row's full prefix on ALL TP ranks, including own chunks."""
+        started = perf_counter()
         group, row, bank, name = self._validate(metadata, "load")
         if (group, row) in self._ready:
+            self._load_seconds += perf_counter() - started
             return
         for req in self._requests:
             identity = (req.request_id, req.allocation_generation, group, row)
             prior = self._prefixes.get(identity)
-            starts, ends, keys = self._plan(req, req.restore_end, group, row)
-            if prior is not None:
-                starts, ends, keys = prior.starts, prior.ends, prior.keys
-            objects = None
+            objects = prior.objects if prior is not None else None
             error = None
             try:
-                objects = self._engine.resolve_layerwise_prefill_row(
-                    *identity,
-                    keys,
-                    starts,
-                    ends,
-                    phase=f"prefill_load:{self._step}",
-                    memory_objs=prior.objects if prior is not None else None,
-                )
+                if prior is None:
+                    starts, ends, keys = self._plan(req, req.restore_end, group, row)
+                    objects = self._engine.resolve_layerwise_prefill_row(
+                        *identity,
+                        keys,
+                        starts,
+                        ends,
+                        phase=f"prefill_load:{self._step}",
+                    )
+                    self._published_handles += len(keys)
+                else:
+                    starts, ends, keys = prior.starts, prior.ends, prior.keys
+                    self._reused_rows += 1
                 if objects:
                     self._transfer(req, name, group, bank, objects, starts, ends, False)
             except Exception as exc:
@@ -272,23 +319,29 @@ class LayerwisePrefillSyncBackend:
             try:
                 self._ack(("load", identity), error)
             except Exception:
-                if objects is not None and (
-                    prior is None or objects is not prior.objects
-                ):
+                if objects is not None and prior is None:
                     if self._unsafe_transfer:
                         self._quarantined.extend(objects)
                     else:
                         self._release(objects)
                 raise
-            if prior is not None and objects is not prior.objects:
-                self._release(prior.objects)
-            self._prefixes[identity] = _RowPrefix(starts, ends, keys, objects)
+            if prior is None:
+                self._prefixes[identity] = _RowPrefix(
+                    starts,
+                    ends,
+                    keys,
+                    objects,
+                    revision=self._step,
+                    slab_generation=self._engine.shared_cpu_cache_generation,
+                )
         self._ready.add((group, row))
+        self._load_seconds += perf_counter() - started
 
     def sync_save(
         self, metadata: Any, kv_layer: Any, attn_metadata: Any = None
     ) -> None:
         """Persist changed suffix chunks, waiting storage futures before returning."""
+        started = perf_counter()
         group, row, bank, name = self._validate(metadata, "save", kv_layer)
         root = self._engine.metadata.is_first_rank()
         for req in self._requests:
@@ -343,11 +396,11 @@ class LayerwisePrefillSyncBackend:
             try:
                 objects = self._engine.resolve_layerwise_prefill_row(
                     *identity,
-                    keys,
-                    starts,
-                    ends,
+                    keys[keep:],
+                    starts[keep:],
+                    ends[keep:],
                     phase=f"prefill_save:{self._step}",
-                    memory_objs=prior.objects[:keep] + fresh if root else None,
+                    memory_objs=fresh if root else None,
                     error=error,
                 )
             except Exception as exc:
@@ -361,10 +414,19 @@ class LayerwisePrefillSyncBackend:
                 else:
                     self._release(acquired)
                 raise
-            self._release(prior.objects[keep:] if root else prior.objects)
-            self._prefixes[identity] = _RowPrefix(starts, ends, keys, objects)
+            self._release(prior.objects[keep:])
+            self._prefixes[identity] = _RowPrefix(
+                starts,
+                ends,
+                keys,
+                prior.objects[:keep] + objects,
+                revision=self._step,
+                slab_generation=self._engine.shared_cpu_cache_generation,
+            )
+            self._published_handles += len(objects)
         self._ready.remove((group, row))
         self._saved[group] += 1
+        self._save_seconds += perf_counter() - started
 
     def finish_step(self) -> None:
         """Require all 79 LATENT and 22 INDEXER rows before the coordinator barrier."""
@@ -380,6 +442,34 @@ class LayerwisePrefillSyncBackend:
                 "expected=79/22"
             )
         self._ack(("finish",), error)
+        # Host-observed wall times include synchronization waits, not isolated
+        # NPU kernel time. Emit no per-layer records or diagnostic device reads.
+        if self._engine.metadata.is_first_rank():
+            elapsed = perf_counter() - self._step_started
+            logger.info(
+                "[PREFILL_SYNC_STEP] event=end step=%d requests=%d saved=%s "
+                "elapsed_ms=%.3f bind_ms=%.3f load_ms=%.3f save_ms=%.3f "
+                "other_ms=%.3f reused_rows=%d published_handles=%d "
+                "completed_ends=%s",
+                self._step,
+                len(self._requests),
+                tuple(self._saved),
+                elapsed * 1000,
+                self._bind_seconds * 1000,
+                self._load_seconds * 1000,
+                self._save_seconds * 1000,
+                max(
+                    0.0,
+                    elapsed
+                    - self._bind_seconds
+                    - self._load_seconds
+                    - self._save_seconds,
+                )
+                * 1000,
+                self._reused_rows,
+                self._published_handles,
+                [(req.request_id, req.compute_end) for req in self._requests],
+            )
         self._bound = False
         self._requests = ()
         self._slots.clear()
@@ -413,6 +503,8 @@ class LayerwisePrefillSyncBackend:
     ) -> tuple[int, int, int, str]:
         error = None
         key = None
+        manifests = []
+        ready = False
         try:
             if not self._bound or self._failed or not self._requests:
                 raise ValueError("Layerwise-prefill callback has no live bound step")
@@ -466,8 +558,35 @@ class LayerwisePrefillSyncBackend:
                 )
             if ordinal != self._saved[group]:
                 raise ValueError("Layerwise-prefill callback is out of group row order")
+            ready = (group, ordinal) in self._ready
+            # Agree on ownership before choosing bootstrap vs. warm reuse. The
+            # exact bind plans plus this committed summary also agree on keep.
+            for req in self._requests:
+                prior = self._prefixes.get(
+                    (req.request_id, req.allocation_generation, group, ordinal)
+                )
+                if prior is None:
+                    manifests.append((False, None, None, None, None))
+                    if phase == "save" or ready:
+                        raise ValueError("Missing retained layerwise-prefill manifest")
+                    continue
+                extent = prior.ends[-1] if prior.ends else 0
+                count = len(prior.objects)
+                manifests.append(
+                    (True, prior.revision, extent, count, prior.slab_generation)
+                )
+                if (
+                    prior.slab_generation != self._engine.shared_cpu_cache_generation
+                    or not 0 < prior.revision <= self._step
+                    or extent != req.restore_end
+                    or count != (extent + 255) // 256
+                    or not (
+                        len(prior.starts) == len(prior.ends) == len(prior.keys) == count
+                    )
+                ):
+                    raise ValueError("Stale layerwise-prefill manifest")
             if phase == "save":
-                if (group, ordinal) not in self._ready:
+                if not ready:
                     raise ValueError(
                         "Layerwise-prefill save arrived before row restore"
                     )
@@ -484,7 +603,7 @@ class LayerwisePrefillSyncBackend:
                         )
         except Exception as exc:
             error = exc
-        self._ack(("validate", phase, key), error)
+        self._ack(("validate", phase, key, ready, tuple(manifests)), error)
         return group, ordinal, bank, key[0]
 
     def _ack(self, identity: tuple, error: Exception | None = None) -> None:

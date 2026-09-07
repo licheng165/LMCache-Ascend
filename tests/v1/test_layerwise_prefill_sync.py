@@ -2,6 +2,7 @@
 """CPU sentinels exercise production P manifests, storage and TP handle exchange."""
 
 # Standard
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
@@ -41,7 +42,7 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
 )
 from lmcache_ascend.v1.npu_connector.utils import permute_kv_caches_to_contiguous
-
+import lmcache_ascend.v1.layerwise_prefill_sync as sync_module
 
 INDEXER_EXECUTIONS = (0, 1, 2, *range(6, 79, 4))
 
@@ -144,14 +145,14 @@ def _sentinel(
 class CPUConnector:
     """Exact packed-plane transfer, with all rows aliasing two recyclable banks."""
 
-    def __init__(self) -> None:
+    def __init__(self, blocks: int = 64) -> None:
         self.layouts = {}
         self.calls = []
         self.fail_load = False
         self.fail_store = False
         self.planes = {
             group: [
-                torch.full((64, 128, 1, 1), -100, dtype=torch.bfloat16)
+                torch.full((blocks, 128, 1, 1), -100, dtype=torch.bfloat16)
                 for _ in range(2 if group == 0 else 1)
             ]
             for group in (0, 1)
@@ -255,7 +256,14 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
 
-    def engine(rank: int = 0, root: Any = None, size: int = 1) -> Any:
+    def engine(
+        rank: int = 0,
+        root: Any = None,
+        size: int = 1,
+        *,
+        blocks: int = 64,
+        slab_bytes: int = 8 << 20,
+    ) -> Any:
         world.size = serving.parallel_config.tensor_parallel_size = size
         thread.rank = rank
         config = lmcache_config.LMCacheEngineConfig.from_defaults()
@@ -292,7 +300,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
         result.shared_cpu_cache_name = "sync-test-slab"
         result.shared_cpu_cache_generation = 11
         result._dsa_kv_topology_view = _view()
-        result.gpu_connector = CPUConnector()
+        result.gpu_connector = CPUConnector(blocks)
         result.token_database = ChunkedTokenDatabase(config, metadata)
 
         def broadcast(obj: Any, src: int) -> Any:
@@ -304,7 +312,9 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
 
         result.broadcast_object_fn = broadcast
         if rank == 0:
-            allocator = TensorMemoryAllocator(torch.empty(8 << 20, dtype=torch.uint8))
+            allocator = TensorMemoryAllocator(
+                torch.empty(slab_bytes, dtype=torch.uint8)
+            )
             allocator.shm_name = result.shared_cpu_cache_name
             allocator.pin_allocator = allocator
             cpu = LocalCPUBackend(config, metadata, memory_allocator=allocator)
@@ -444,6 +454,30 @@ def _step(engine: Any, backend: Any, requests: list) -> None:
             for plane in registry[key[0]]:
                 plane.fill_(-100)
     backend.finish_step()
+
+
+def _count_manifest_sources(
+    monkeypatch: pytest.MonkeyPatch, engine: Any, backend: Any
+) -> Counter:
+    counts = Counter()
+
+    def track(target: Any, method_name: str, counter: str) -> None:
+        method = getattr(target, method_name)
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            counts[counter] += len(kwargs["keys_layer"]) if counter == "handles" else 1
+            return method(*args, **kwargs)
+
+        monkeypatch.setattr(target, method_name, counted)
+
+    track(backend, "_plan", "plans")
+    track(engine, "resolve_layerwise_prefill_row", "resolves")
+    track(engine, "_make_shared_handles_for_layer", "handles")
+    track(engine, "broadcast_object_fn", "broadcasts")
+    track(engine, "layerwise_prefill_ack", "acks")
+    if not engine.metadata.is_first_rank():
+        track(engine.shared_cpu_cache_passive_allocator, "create_view", "views")
+    return counts
 
 
 @pytest.mark.parametrize("request_count", [1, 4])
@@ -632,6 +666,52 @@ def test_tp_passive_restores_every_row_but_never_stores(runtime: Any) -> None:
     )
 
 
+def test_step_progress_is_root_only_and_reports_completed_extent(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = runtime.engine(size=2)
+    passive = runtime.engine(1, root, size=2)
+    runtime.thread.rank = 0
+    root_backend = root.layerwise_prefill_window_backend
+    runtime.thread.rank = 1
+    passive_backend = passive.layerwise_prefill_window_backend
+    logged = []
+    monkeypatch.setattr(
+        sync_module.logger,
+        "info",
+        lambda message, *args: logged.append(message % args),
+    )
+    for start, end in ((0, 300), (300, 530)):
+        requests = [_request(start=start, end=end)]
+        runtime.parallel(
+            lambda requests=requests: _step(root, root_backend, requests),
+            lambda requests=requests: _step(passive, passive_backend, requests),
+        )
+    assert len(logged) == 4
+    assert ["event=begin" in line for line in logged] == [True, False, True, False]
+    assert "saved=(79, 22)" in logged[-1]
+    assert "reused_rows=101 published_handles=202" in logged[-1]
+    assert "completed_ends=[('req-0', 530)]" in logged[-1]
+    for name in ("elapsed_ms", "bind_ms", "load_ms", "save_ms", "other_ms"):
+        assert name + "=" in logged[-1]
+
+
+def test_failed_step_does_not_log_a_completed_extent(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = runtime.engine()
+    backend = engine.layerwise_prefill_window_backend
+    logged = []
+    monkeypatch.setattr(
+        sync_module.logger, "info", lambda message, *args: logged.append(message % args)
+    )
+    backend.bind_step([_request()], _registry(engine))
+    with pytest.raises(ValueError, match="Incomplete"):
+        backend.finish_step()
+    assert len(logged) == 1
+    assert "event=begin" in logged[0]
+
+
 @pytest.mark.parametrize("failure", ["missing", "passive_load", "root_store"])
 def test_tp_errors_reach_all_peers(runtime: Any, failure: str) -> None:
     root = runtime.engine(size=2)
@@ -734,7 +814,17 @@ def test_factory_off_and_incomplete_step(
     backend.abort_request("req-0")
 
 
-def test_real_two_process_gloo_shared_slab(runtime: Any, tmp_path: Any) -> None:
+@pytest.mark.parametrize(
+    "generation,failure",
+    [(1, None), (2, None), (2, "missing"), (2, "revision"), (2, "slab")],
+)
+def test_real_two_process_gloo_shared_slab(
+    runtime: Any,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    generation: int,
+    failure: str | None,
+) -> None:
     """Use real Gloo acknowledgements and shared slab bytes, not fake collectives."""
     root = runtime.engine(size=2)
     root.storage_manager.local_cpu_backend.memory_allocator.buffer.share_memory_()
@@ -766,8 +856,90 @@ def test_real_two_process_gloo_shared_slab(runtime: Any, tmp_path: Any) -> None:
 
             engine.broadcast_object_fn = broadcast
             backend = engine.layerwise_prefill_window_backend
+            counts = _count_manifest_sources(monkeypatch, engine, backend)
             _step(engine, backend, [_request()])
-            _step(engine, backend, [_request(start=300, end=530, generation=2)])
+            assert counts == Counter(
+                plans=202,
+                resolves=202,
+                broadcasts=202,
+                acks=406,
+                **({"handles": 202} if rank == 0 else {"views": 202}),
+            )
+            old = dict(backend._prefixes)
+            if failure is not None:
+                requests = [_request(start=300, end=530, generation=generation)]
+                backend.bind_step(requests, _registry(engine))
+                identity = ("req-0", generation, 0, 0)
+                prior = backend._prefixes[identity]
+                if rank == 1:
+                    if failure == "missing":
+                        del backend._prefixes[identity]
+                    elif failure == "revision":
+                        backend._prefixes[identity] = replace(prior, revision=2)
+                    else:
+                        engine.shared_cpu_cache_generation = 12
+                counts.clear()
+                calls = list(engine.gpu_connector.calls)
+                with pytest.raises(ValueError, match="manifest|identity mismatch"):
+                    backend.wait_for_load(
+                        _metadata(_view(), _view().rows_by_group[0][0], requests)
+                    )
+                assert counts == Counter(acks=1)
+                assert engine.gpu_connector.calls == calls
+                assert backend._failed
+                backend._prefixes[identity] = prior
+                backend.abort_request("req-0")
+                results.put((rank, "closed"))
+                torch.distributed.destroy_process_group()
+                return
+            counts.clear()
+            load = backend.wait_for_load
+
+            def warm_load(metadata: Any) -> None:
+                row = metadata.row
+                prior = old["req-0", 1, row.kv_group, row.row_ordinal]
+                identity = ("req-0", generation, row.kv_group, row.row_ordinal)
+                assert backend._prefixes[identity] is prior
+                assert prior.revision == 1 and prior.slab_generation == 11
+                ownership = [
+                    (obj.get_ref_count(), obj.metadata.pin_count)
+                    for obj in prior.objects
+                ]
+                before = counts.copy()
+                load(metadata)
+                assert counts - before == Counter(acks=2)
+                assert backend._prefixes[identity] is prior
+                assert ownership == [
+                    (obj.get_ref_count(), obj.metadata.pin_count)
+                    for obj in prior.objects
+                ]
+                assert engine.gpu_connector.calls[-1] == (
+                    False,
+                    row.kv_group,
+                    (0, 256),
+                    (256, 300),
+                )
+
+            monkeypatch.setattr(backend, "wait_for_load", warm_load)
+            _step(
+                engine, backend, [_request(start=300, end=530, generation=generation)]
+            )
+            assert counts == Counter(
+                plans=101,
+                resolves=101,
+                broadcasts=101,
+                acks=406,
+                **({"handles": 202} if rank == 0 else {"views": 202}),
+            )
+            for (_, _, group, row), prior in old.items():
+                current = backend._prefixes["req-0", generation, group, row]
+                assert current.revision == 2 and current.slab_generation == 11
+                assert len(current.objects) == 3
+                assert current.objects[0] is prior.objects[0]
+                assert prior.objects[0].get_ref_count() == (2 if rank == 0 else 1)
+                assert prior.objects[0].metadata.pin_count == 1
+                assert prior.objects[1].get_ref_count() == (1 if rank == 0 else 0)
+                assert prior.objects[1].metadata.pin_count == 0
             backend.abort_request("req-0")
             calls = engine.gpu_connector.calls
             results.put(
@@ -793,13 +965,279 @@ def test_real_two_process_gloo_shared_slab(runtime: Any, tmp_path: Any) -> None:
         for process in processes:
             process.join(timeout=10)
             assert process.exitcode == 0
-        assert sorted(outcomes) == [(0, 202, 101), (1, 0, 101)]
+        assert sorted(outcomes) == (
+            [(0, 202, 101), (1, 0, 101)]
+            if failure is None
+            else [(0, "closed"), (1, "closed")]
+        )
     finally:
         for process in processes:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=10)
         results.close()
+
+
+def test_large_manifest_reuses_208_chunks_and_publishes_only_16(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # TensorMemoryAllocator rounds each tiny sentinel chunk to a 4 KiB slab slot.
+    root = runtime.engine(size=2, blocks=900, slab_bytes=128 << 20)
+    passive = runtime.engine(1, root, size=2, blocks=900)
+    runtime.thread.rank = 0
+    rb = root.layerwise_prefill_window_backend
+    runtime.thread.rank = 1
+    pb = passive.layerwise_prefill_window_backend
+    first_end, next_end = 208 * 256, 224 * 256
+    req = replace(
+        _request(),
+        token_ids=tuple(range(next_end)),
+        compute_end=first_end,
+        block_ids_by_bank=tuple(
+            (tuple(range(1 + bank * 448, 449 + bank * 448)),) * 2 for bank in (0, 1)
+        ),
+    )
+    runtime.parallel(lambda: _step(root, rb, [req]), lambda: _step(passive, pb, [req]))
+    previous = [backend._prefixes["req-0", 1, 0, 0] for backend in (rb, pb)]
+    req = replace(
+        req,
+        compute_start=first_end,
+        restore_end=first_end,
+        compute_end=next_end,
+        allocation_generation=2,
+    )
+    runtime.parallel(
+        lambda: rb.bind_step([req], _registry(root)),
+        lambda: pb.bind_step([req], _registry(passive)),
+    )
+    counts = [
+        _count_manifest_sources(monkeypatch, engine, backend)
+        for engine, backend in ((root, rb), (passive, pb))
+    ]
+    metadata = _metadata(_view(), _view().rows_by_group[0][0], [req])
+    runtime.parallel(
+        lambda: rb.wait_for_load(metadata), lambda: pb.wait_for_load(metadata)
+    )
+    assert counts == [Counter(acks=2), Counter(acks=2)]
+    for engine in (root, passive):
+        assert engine.gpu_connector.calls[-1] == (
+            False,
+            0,
+            tuple(range(0, first_end, 256)),
+            tuple(range(256, first_end + 1, 256)),
+        )
+        slots = _slots(req, 0, 0, next_end)
+        for index, plane in enumerate(engine.gpu_connector.planes[0]):
+            expected = _sentinel(req, 0, 0, index, next_end)
+            assert torch.equal(plane.view(-1)[slots[:first_end]], expected[:first_end])
+            plane.view(-1)[slots[first_end:]] = expected[first_end:]
+    runtime.parallel(
+        lambda: rb.sync_save(metadata, _registry(root)[metadata.row.layer_name]),
+        lambda: pb.sync_save(metadata, _registry(passive)[metadata.row.layer_name]),
+    )
+    assert counts == [
+        Counter(acks=4, plans=1, resolves=1, broadcasts=1, handles=16),
+        Counter(acks=4, plans=1, resolves=1, broadcasts=1, views=16),
+    ]
+    for rank, (backend, prior) in enumerate(zip((rb, pb), previous, strict=True)):
+        current = backend._prefixes["req-0", 2, 0, 0]
+        assert len(current.objects) == 224
+        assert all(
+            obj is old
+            for obj, old in zip(current.objects[:208], prior.objects, strict=True)
+        )
+        assert all(
+            obj.get_ref_count() == (2 if rank == 0 else 1)
+            and obj.metadata.pin_count == 1
+            for obj in prior.objects
+        )
+        backend.abort_request("req-0")
+
+
+@pytest.mark.parametrize(
+    "phase,mutate",
+    [
+        ("bind", "missing"),
+        ("load", "missing"),
+        ("load", "revision"),
+        ("load", "extent"),
+        ("load", "count"),
+        ("load", "slab"),
+        ("load", "engine_slab"),
+        ("load", "ready"),
+        ("save", "missing"),
+        ("save", "revision"),
+        ("save", "slab"),
+    ],
+)
+def test_one_peer_manifest_mismatch_fails_before_transfer_or_broadcast(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, phase: str, mutate: str
+) -> None:
+    root = runtime.engine(size=2)
+    passive = runtime.engine(1, root, size=2)
+    runtime.thread.rank = 0
+    rb = root.layerwise_prefill_window_backend
+    runtime.thread.rank = 1
+    pb = passive.layerwise_prefill_window_backend
+    runtime.parallel(
+        lambda: _step(root, rb, [_request()]),
+        lambda: _step(passive, pb, [_request()]),
+    )
+    requests = [_request(start=300, end=530, generation=2)]
+    metadata = _metadata(_view(), _view().rows_by_group[0][0], requests)
+    if phase != "bind":
+        runtime.parallel(
+            lambda: rb.bind_step(requests, _registry(root)),
+            lambda: pb.bind_step(requests, _registry(passive)),
+        )
+    if phase == "save":
+        runtime.parallel(
+            lambda: rb.wait_for_load(metadata), lambda: pb.wait_for_load(metadata)
+        )
+    identity = ("req-0", 1 if phase == "bind" else 2, 0, 0)
+    prior = pb._prefixes[identity]
+    ownership = [(obj.get_ref_count(), obj.metadata.pin_count) for obj in prior.objects]
+    if mutate == "missing":
+        del pb._prefixes[identity]
+    elif mutate == "revision":
+        pb._prefixes[identity] = replace(prior, revision=pb._step)
+    elif mutate == "extent":
+        pb._prefixes[identity] = replace(prior, ends=[256, 299])
+    elif mutate == "count":
+        pb._prefixes[identity] = replace(prior, objects=prior.objects[:1])
+    elif mutate == "slab":
+        pb._prefixes[identity] = replace(prior, slab_generation=12)
+    elif mutate == "ready":
+        pb._ready.add((0, 0))
+    else:
+        passive.shared_cpu_cache_generation = 12
+    counts = [
+        _count_manifest_sources(monkeypatch, engine, backend)
+        for engine, backend in ((root, rb), (passive, pb))
+    ]
+    transfers = [list(engine.gpu_connector.calls) for engine in (root, passive)]
+
+    def fail(engine: Any, backend: Any) -> None:
+        with pytest.raises(ValueError, match="manifest|identity mismatch"):
+            if phase == "bind":
+                backend.bind_step(requests, _registry(engine))
+            elif phase == "load":
+                backend.wait_for_load(metadata)
+            else:
+                backend.sync_save(metadata, _registry(engine)[metadata.row.layer_name])
+
+    try:
+        runtime.parallel(lambda: fail(root, rb), lambda: fail(passive, pb))
+        assert counts == [Counter(acks=1), Counter(acks=1)]
+        assert transfers == [engine.gpu_connector.calls for engine in (root, passive)]
+        assert ownership == [
+            (obj.get_ref_count(), obj.metadata.pin_count) for obj in prior.objects
+        ]
+    finally:
+        pb._prefixes[identity] = prior
+        rb.abort_request("req-0")
+        pb.abort_request("req-0")
+
+
+@pytest.mark.parametrize("failure", ["future", "passive_ack"])
+def test_delta_failure_preserves_old_manifest_and_releases_only_fresh_ownership(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    root = runtime.engine(size=2)
+    passive = runtime.engine(1, root, size=2)
+    root.config.remote_url = passive.config.remote_url = "mooncakestore://required"
+    completed = Future()
+    completed.set_result(None)
+    remote = RequiredStore(root.storage_manager.local_cpu_backend, completed)
+    root.storage_manager.storage_backends["RemoteBackend"] = remote
+    runtime.thread.rank = 0
+    rb = root.layerwise_prefill_window_backend
+    runtime.thread.rank = 1
+    pb = passive.layerwise_prefill_window_backend
+    runtime.parallel(
+        lambda: _step(root, rb, [_request()]),
+        lambda: _step(passive, pb, [_request()]),
+    )
+    requests = [_request(start=300, end=530, generation=2)]
+    runtime.parallel(
+        lambda: rb.bind_step(requests, _registry(root)),
+        lambda: pb.bind_step(requests, _registry(passive)),
+    )
+    metadata = _metadata(_view(), _view().rows_by_group[0][0], requests)
+    runtime.parallel(
+        lambda: rb.wait_for_load(metadata), lambda: pb.wait_for_load(metadata)
+    )
+    identity = ("req-0", 2, 0, 0)
+    previous = [backend._prefixes[identity] for backend in (rb, pb)]
+    ownership = [
+        [(obj.get_ref_count(), obj.metadata.pin_count) for obj in prior.objects]
+        for prior in previous
+    ]
+    cached = dict(root.storage_manager.local_cpu_backend.hot_cache)
+    fresh_views = []
+    create_view = passive.shared_cpu_cache_passive_allocator.create_view
+
+    def acquire(*args: Any, **kwargs: Any) -> Any:
+        obj = create_view(*args, **kwargs)
+        fresh_views.append(obj)
+        return obj
+
+    monkeypatch.setattr(
+        passive.shared_cpu_cache_passive_allocator, "create_view", acquire
+    )
+    if failure == "passive_ack":
+        ack = passive.layerwise_prefill_ack
+
+        def reject(identity: Any, error: Any = None) -> None:
+            if identity[1][0] == "save":
+                error = ValueError("save acknowledgement failure")
+            ack(identity, error)
+
+        monkeypatch.setattr(passive, "layerwise_prefill_ack", reject)
+    delayed = Future()
+    remote.put_result = [delayed]
+    remote.submitted.clear()
+
+    def save(engine: Any, backend: Any) -> None:
+        with pytest.raises(
+            ValueError, match="delta persist failed|acknowledgement failure"
+        ):
+            backend.sync_save(metadata, _registry(engine)[metadata.row.layer_name])
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        saved = pool.submit(
+            runtime.parallel, lambda: save(root, rb), lambda: save(passive, pb)
+        )
+        assert remote.submitted.wait(5)
+        assert not saved.done()
+        assert len(remote.calls[-1][0]) == 2
+        if failure == "future":
+            delayed.set_exception(RuntimeError("delta persist failed"))
+        else:
+            delayed.set_result(None)
+        saved.result(timeout=20)
+    for backend, prior, owned in zip((rb, pb), previous, ownership, strict=True):
+        assert backend._failed
+        assert backend._prefixes[identity] is prior
+        assert prior.revision == 1 and prior.slab_generation == 11
+        assert owned == [
+            (obj.get_ref_count(), obj.metadata.pin_count) for obj in prior.objects
+        ]
+    fresh_root = [
+        obj
+        for key, obj in root.storage_manager.local_cpu_backend.hot_cache.items()
+        if key not in cached
+    ]
+    assert len(fresh_root) == 2
+    assert all(
+        obj.get_ref_count() == 1 and obj.metadata.pin_count == 0 for obj in fresh_root
+    )
+    assert len(fresh_views) == (0 if failure == "future" else 2)
+    assert all(
+        obj.get_ref_count() == 0 and obj.metadata.pin_count == 0 for obj in fresh_views
+    )
+    rb.abort_request("req-0")
+    pb.abort_request("req-0")
 
 
 def test_allocation_failure_releases_partial_batch(
