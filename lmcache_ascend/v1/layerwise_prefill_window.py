@@ -113,6 +113,8 @@ class LayerwisePrefillDeviceOps:
         bank: int,
         kv_planes: list[torch.Tensor],
         attn_metadata: Any,
+        *,
+        metadata: Any,
     ) -> None:
         """Stage 3 contract: fully save one row in one call."""
         raise NotImplementedError
@@ -464,7 +466,9 @@ class LayerwisePrefillNPUWindowBackend:
         key, group, row_ordinal, bank = self._row(metadata)
         planes = self._kv_planes(group, kv_layer)
         generations = self._validate_launch(metadata)
-        self._ops.sync_save(group, row_ordinal, bank, planes, attn_metadata)
+        self._ops.sync_save(
+            group, row_ordinal, bank, planes, attn_metadata, metadata=metadata
+        )
         self._active_generations.update(generations)
         self._ledger(group, bank).ready_identity = None
 

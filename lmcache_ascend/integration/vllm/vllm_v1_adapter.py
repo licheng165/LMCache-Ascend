@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 # Third Party
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
+    LayerwisePrefillWindowCoordinator,
     ReqMeta,
 )
 from lmcache.logging import init_logger
@@ -125,6 +126,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE must be 'true' or 'false', "
             f"got {raw!r}"
         )
+
+    def _build_layerwise_prefill_window(
+        self,
+    ) -> Optional[LayerwisePrefillWindowCoordinator]:
+        if self._role != KVConnectorRole.SCHEDULER and self._layerwise_prefill_p_node:
+            self.lmcache_engine.configure_layerwise_prefill_sync(self._vllm_config)
+        return super()._build_layerwise_prefill_window()
 
     def _validate_sparse_decode_d_node_prerequisites(
         self,
@@ -437,6 +445,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         }
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
+        if getattr(self, "_layerwise_prefill_p_node", False):
+            # Row callbacks already fenced D2H and required storage futures.
+            # The legacy all-layer fallback cannot read recycled P banks.
+            return
         if self.kv_role != "kv_consumer" and self.lmcache_engine is not None:
             self.lmcache_engine.wait_for_pending_sync_stores()
             requests = self._direct_prefill_requests() or []

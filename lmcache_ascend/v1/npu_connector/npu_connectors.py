@@ -1567,6 +1567,218 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         self._direct_page_layout_cache: dict[
             int, tuple[tuple, list[tuple[int, int]]]
         ] = {}
+        self._layerwise_prefill_row_failed_owners: Optional[list[Any]] = None
+
+    def transfer_layerwise_prefill_row(
+        self,
+        kv_layer: Sequence[torch.Tensor],
+        cpu_chunks: Sequence[torch.Tensor],
+        starts: Sequence[int],
+        ends: Sequence[int],
+        slot_mapping: torch.Tensor,
+        *,
+        kv_group: int,
+        direction: bool,
+        slot_mapping_base: int = 0,
+    ) -> None:
+        """Synchronously transfer one actual MLA/DSA row, without KV staging.
+
+        ``direction=True`` stores NPU -> CPU; ``False`` loads CPU -> NPU.
+        The full group's layout must already be registered. ``kv_layer`` is
+        the actual tuple/list of contiguous BF16 PA-BSND planes, not a layer
+        ordinal or a singleton group. Each registered local CPU tensor contains
+        exactly ``end - start`` tokens, packed as stacked planes (including
+        short tails). Ranges index ``slot_mapping`` relative to its absolute
+        ``slot_mapping_base``; gaps are allowed and H2D slots must be unique.
+        Empty chunks/starts/ends are an explicit no-op.
+
+        Owners and metadata survive the completion fence, even if launch fails.
+        A failed fence retains them on the connector and disables this hook:
+        callers must not publish/recycle their banks after such an error.
+        """
+        if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
+            raise RuntimeError("A previous prefill row completion fence failed")
+        if type(kv_group) is not int or kv_group < 0:
+            raise ValueError("kv_group must be a non-negative integer")
+        if type(direction) is not bool:
+            raise ValueError("direction must be bool (True=D2H, False=H2D)")
+        if type(slot_mapping_base) is not int or slot_mapping_base < 0:
+            raise ValueError("slot_mapping_base must be a non-negative integer")
+        chunks = tuple(cpu_chunks)
+        starts, ends = tuple(starts), tuple(ends)
+        if len(chunks) != len(starts) or len(starts) != len(ends):
+            raise ValueError("Prefill row chunk/range counts must match")
+        if not chunks:
+            return
+
+        layout = self._group_layouts.get(kv_group)
+        if (
+            layout is None
+            or layout.num_layers <= 0
+            or layout.layer_indices != tuple(range(layout.num_layers))
+        ):
+            raise ValueError(
+                f"Prefill row requires a registered full group layout: {kv_group}"
+            )
+        if layout.kv_format == KVCacheFormat.DSA_INDEX:
+            widths = (layout.dsa_hidden_dims,)
+            head_dims = (layout.dsa_head_dim,)
+            if layout.k_hidden_dims != widths[0] or layout.v_hidden_dims != 0:
+                raise ValueError("Invalid registered DSA indexer dimensions")
+        elif layout.kv_format in (
+            KVCacheFormat.MLA_KV,
+            KVCacheFormat.MLA_LATENT,
+            KVCacheFormat.DSA_KV,
+        ):
+            widths = (layout.k_hidden_dims, layout.v_hidden_dims)
+            head_dims = (layout.kv_lora_rank, layout.qk_rope_head_dim)
+            if layout.kv_format == KVCacheFormat.DSA_KV:
+                widths += (layout.dsa_hidden_dims,)
+                head_dims += (layout.dsa_head_dim,)
+        else:
+            raise ValueError("Prefill row requires a registered MLA/DSA layout")
+        device = layout.kv_device
+        if (
+            device is None
+            or device.type != "npu"
+            or layout.vllm_two_major
+            or any(dim <= 0 for dim in (*widths, *head_dims))
+        ):
+            raise ValueError("Prefill row requires a positive PA-BSND NPU layout")
+        if self.dtype != torch.bfloat16:
+            raise ValueError("Prefill row requires BF16 connector dtype")
+        if not isinstance(kv_layer, (tuple, list)) or len(kv_layer) != len(widths):
+            raise ValueError("Prefill row requires exactly the registered KV planes")
+        planes = tuple(kv_layer)
+        for plane, width, head_dim in zip(planes, widths, head_dims, strict=True):
+            if (
+                not isinstance(plane, torch.Tensor)
+                or plane.dtype != torch.bfloat16
+                or plane.device != device
+                or plane.layout != torch.strided
+                or plane.ndim != 4
+                or not plane.is_contiguous()
+                or any(dim <= 0 for dim in plane.shape)
+                or plane.shape[:2] != planes[0].shape[:2]
+                or plane.shape[-1] != head_dim
+                or plane.shape[-2] * plane.shape[-1] != width
+            ):
+                raise ValueError(
+                    "Prefill row KV planes must match registered BF16 PA-BSND "
+                    "geometry, be contiguous, and share the same NPU device"
+                )
+        capacity = int(planes[0].shape[0] * planes[0].shape[1])
+        if (
+            not isinstance(slot_mapping, torch.Tensor)
+            or slot_mapping.ndim != 1
+            or slot_mapping.layout != torch.strided
+            or slot_mapping.dtype not in (torch.int32, torch.int64)
+            or (slot_mapping.device.type != "cpu" and slot_mapping.device != device)
+        ):
+            raise ValueError("slot_mapping must be 1D int32/int64 on CPU or the KV NPU")
+
+        offsets, sizes, ranges = [], [], []
+        total_tokens = 0
+        for chunk, start, end in zip(chunks, starts, ends, strict=True):
+            if type(start) is not int or type(end) is not int:
+                raise ValueError("Prefill row ranges must contain integers")
+            local_start, local_end = start - slot_mapping_base, end - slot_mapping_base
+            if (
+                local_start < 0
+                or local_end <= local_start
+                or local_end > len(slot_mapping)
+            ):
+                raise ValueError(
+                    "Prefill row requires positive ranges inside slot_mapping"
+                )
+            size = end - start
+            if (
+                not isinstance(chunk, torch.Tensor)
+                or chunk.device.type != "cpu"
+                or chunk.dtype != torch.bfloat16
+                or chunk.layout != torch.strided
+                or not chunk.is_contiguous()
+                or chunk.numel() != size * sum(widths)
+            ):
+                raise ValueError(
+                    "Prefill row CPU chunks must be local contiguous BF16 tensors "
+                    "with exact packed plane sizes, including tails"
+                )
+            offsets.append(total_tokens)
+            sizes.append(size)
+            ranges.append((local_start, local_end))
+            total_tokens += size
+        if total_tokens > torch.iinfo(torch.int32).max:
+            raise ValueError("Prefill row token count exceeds the native int32 limit")
+
+        transfer_stream = self.store_stream if direction else self.load_stream
+        if transfer_stream.device != device:
+            raise ValueError("Prefill row transfer stream must be on the KV NPU device")
+        # Native commands retain raw pointers, not these Python tensor owners.
+        owners: list[Any] = [planes, chunks, slot_mapping]
+        with torch.npu.device(device):
+            compute_stream = torch.npu.current_stream(device)
+            try:
+                with torch.npu.stream(transfer_stream):
+                    transfer_stream.wait_stream(compute_stream)
+                    slots = torch.cat([slot_mapping[s:e] for s, e in ranges])
+                    owners.append(slots)
+                    slot_values = slots.detach().to(device="cpu").tolist()
+                    if any(slot < 0 or slot >= capacity for slot in slot_values):
+                        raise ValueError("Prefill row slot is out of KV capacity")
+                    if not direction and len(set(slot_values)) != total_tokens:
+                        raise ValueError(
+                            "Prefill row H2D slot_mapping contains duplicate slots"
+                        )
+                    slots_npu = slots.to(device=device, dtype=torch.int64)
+                    owners.append(slots_npu)
+                    pointers = [
+                        self._resolve_registered_cpu_source_device_ptr(
+                            chunk,
+                            layer_id=-1,
+                            chunk_index=index,
+                            source="transfer_layerwise_prefill_row",
+                        )
+                        for index, chunk in enumerate(chunks)
+                    ]
+                    if any(ptr <= 0 for ptr in pointers):
+                        raise RuntimeError(
+                            "Prefill row CPU registered pointer must be positive"
+                        )
+                    pointers_npu = torch.tensor(
+                        pointers, dtype=torch.int64, device=device
+                    )
+                    owners.append(pointers_npu)
+                    offsets_npu = torch.tensor(
+                        offsets, dtype=torch.int32, device=device
+                    )
+                    owners.append(offsets_npu)
+                    sizes_npu = torch.tensor(sizes, dtype=torch.int32, device=device)
+                    owners.append(sizes_npu)
+                    dense_mla_dsa_batched_direct_kv_transfer(
+                        chunks,
+                        planes,
+                        slots_npu,
+                        offsets_npu,
+                        sizes_npu,
+                        total_tokens,
+                        kvcache_format_raw=layout.kv_format.value,
+                        token_major=False,
+                        vllm_two_major=False,
+                        k_hidden_dims=layout.k_hidden_dims,
+                        v_hidden_dims=layout.v_hidden_dims,
+                        dsa_hidden_dims=layout.dsa_hidden_dims,
+                        lmc_host_interleaved=False,
+                        direction=direction,
+                        chunk_ptrs_npu=pointers_npu,
+                        fixed_chunk_size=0,
+                    )
+            finally:
+                try:
+                    transfer_stream.synchronize()
+                except BaseException:
+                    self._layerwise_prefill_row_failed_owners = owners
+                    raise
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE

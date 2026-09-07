@@ -39,12 +39,13 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
-from lmcache.v1.memory_management import LayerPageSource, MemoryObj
+from lmcache.v1.memory_management import LayerPageSource, MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
     mooncake_page_layout_enabled,
 )
+from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
     SharedHandleEnvelope,
@@ -59,6 +60,10 @@ from lmcache_ascend.v1.dsa_kv_topology import (
     validate_dsa_kv_topology,
     validate_matching_dsa_kv_topologies,
 )
+from lmcache_ascend.v1.layerwise_prefill_sync import (
+    LayerwisePrefillFenceError,
+    LayerwisePrefillSyncBackend,
+)
 from lmcache_ascend.v1.layerwise_prefill_window import (
     LayerwisePrefillNPUWindowBackend,
 )
@@ -68,6 +73,17 @@ logger = init_logger(__name__)
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
+
+
+def _layerwise_prefill_p_node_enabled() -> bool:
+    raw = os.environ.get("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    value = raw.strip().lower()
+    if value not in ("true", "false"):
+        raise ValueError(
+            "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE must be 'true' or 'false', "
+            f"got {raw!r}"
+        )
+    return value == "true"
 
 
 def _shared_sparse_request(request):
@@ -446,18 +462,22 @@ class AscendLMCacheEngine(LMCacheEngine):
     @property
     def layerwise_prefill_window_backend(
         self,
-    ) -> Optional[LayerwisePrefillNPUWindowBackend]:
-        """Stage 4 transfer-window backend, gated on NPU connector support.
+    ) -> Optional[Union[LayerwisePrefillNPUWindowBackend, LayerwisePrefillSyncBackend]]:
+        """Expose sync-only production P, or an explicitly opted-in window.
 
-        The generic LMCache connector consumes this attribute to freeze its
-        layerwise-prefill capabilities. It is only non-None when the engine
-        holds a validated DSA topology and the layerwise NPU connector
-        opted into the transfer-window device-ops contract, so any
-        unsupported deployment keeps the whole protocol disabled instead of
-        partially launching.
+        With P enabled, unsupported configurations raise before capabilities
+        can be frozen; there is no legacy or transfer-window fallback.
         """
+        p_enabled = _layerwise_prefill_p_node_enabled()
         backend = getattr(self, "_layerwise_prefill_window_backend", None)
         if backend is not None:
+            return backend
+        if p_enabled:
+            # P must never fall through to a window or the legacy all-layer path.
+            backend = LayerwisePrefillSyncBackend(
+                self, getattr(self, "_dsa_kv_topology_view", None)
+            )
+            self._layerwise_prefill_window_backend = backend
             return backend
         view = getattr(self, "_dsa_kv_topology_view", None)
         if view is None:
@@ -488,6 +508,363 @@ class AscendLMCacheEngine(LMCacheEngine):
             backend.persists_indexer_group,
         )
         return backend
+
+    def configure_layerwise_prefill_sync(self, vllm_config: Any) -> None:
+        """Bind serving configuration before freezing P backend capabilities.
+
+        The integration adapter must call this before reading
+        ``layerwise_prefill_window_backend``. KV connector construction is not
+        inside vLLM's current-config context. Reconfiguration after capability
+        freeze is rejected.
+        """
+        if getattr(self, "_layerwise_prefill_window_backend", None) is not None:
+            raise ValueError("Cannot reconfigure a frozen layerwise-prefill backend")
+        self._layerwise_prefill_serving_config = vllm_config
+
+    def validate_layerwise_prefill_sync(self, view: DSAKVTopologyView) -> None:
+        """Reject unsupported P deployments before advertising sync callbacks.
+
+        Only eager, single-host TP, BF16 two-group 79/22 MLA with strict shared
+        CPU storage and exact 256-token chunks is supported. Raises ValueError
+        if any prerequisite (including the synchronous row hook) is absent.
+        """
+        config, metadata = self.config, self.metadata
+        if not _layerwise_prefill_p_node_enabled():
+            raise ValueError("Layerwise-prefill sync requires the P-node flag")
+        if (
+            not config.use_layerwise
+            or not config.dsa_two_groups
+            or not config.local_cpu
+            or config.max_local_cpu_size <= 0
+            or not config.enable_shared_cpu_cache
+            or not config.shared_cpu_cache_strict
+            or not self.enable_shared_cpu_cache
+            or not self.shared_cpu_cache_strict
+            or config.enable_blending
+            or config.store_async
+            or config.chunk_size != 256
+            or not config.save_unfull_chunk
+            or not metadata.use_mla
+            or metadata.kv_dtype != torch.bfloat16
+            or any(dtype != torch.bfloat16 for dtype in metadata.get_dtypes())
+            or not self.save_only_first_rank
+            or not self.save_indexer_only_first_rank
+            or view is None
+            or view.layer_counts != (79, 22)
+            or view != getattr(self, "_dsa_kv_topology_view", None)
+        ):
+            raise ValueError(
+                "Layerwise-prefill sync requires BF16 MLA 79/22, two groups, "
+                "strict shared LocalCPU, rank0-only stores, chunk_size=256, "
+                "save_unfull_chunk=true and store_async=false"
+            )
+        if mooncake_page_layout_enabled(config) or mooncake_layer_pages_enabled(config):
+            raise ValueError(
+                "Layerwise-prefill sync does not support page-first/merged pages"
+            )
+        if not callable(
+            getattr(self.gpu_connector, "transfer_layerwise_prefill_row", None)
+        ):
+            raise ValueError(
+                "Layerwise-prefill sync requires the synchronous NPU row hook"
+            )
+        from vllm.distributed.parallel_state import get_tp_group
+
+        serving = getattr(self, "_layerwise_prefill_serving_config", None)
+        if serving is None:
+            raise ValueError(
+                "Call engine.configure_layerwise_prefill_sync(vllm_config) "
+                "before freezing layerwise-prefill capabilities"
+            )
+        parallel = serving.parallel_config
+        speculative = getattr(serving, "speculative_config", None)
+        if speculative is not None and (
+            speculative.method != "mtp"
+            or type(speculative.num_speculative_tokens) is not int
+            or speculative.num_speculative_tokens != 1
+        ):
+            raise ValueError(
+                "Layerwise-prefill sync supports only method=mtp with "
+                "num_speculative_tokens=1; physical row 78 cannot repeat"
+            )
+        if (
+            parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or getattr(parallel, "enable_dbo", False)
+            or not serving.model_config.enforce_eager
+        ):
+            raise ValueError(
+                "Layerwise-prefill sync requires eager execution, no DBO, "
+                "and PP=PCP=DCP=1"
+            )
+        if (
+            metadata.world_size != parallel.tensor_parallel_size
+            or metadata.local_world_size != metadata.world_size
+            or metadata.first_rank != 0
+        ):
+            raise ValueError(
+                "Layerwise-prefill sync requires single-host TP with first_rank=0"
+            )
+        tp = get_tp_group()
+        if (
+            tp.world_size != metadata.world_size
+            or tp.rank_in_group != metadata.worker_id
+            or (
+                tp.world_size > 1
+                and (
+                    tp.cpu_group is None
+                    or not torch.distributed.is_initialized()
+                    or not callable(self.broadcast_object_fn)
+                )
+            )
+        ):
+            raise ValueError(
+                "Layerwise-prefill sync requires live TP CPU control channels"
+            )
+
+    def initialize_layerwise_prefill_layout(self, kv_caches: dict[str, Any]) -> None:
+        """Initialize both complete registry-ordered layouts, never a singleton row."""
+        if not self.shared_cpu_cache_name:
+            raise ValueError("Layerwise-prefill requires shared CPU startup preflight")
+        if self.metadata.is_first_rank():
+            if self._shared_rank0_object_context(0) is None:
+                raise ValueError("Layerwise-prefill requires the rank0 shared CPU slab")
+        elif self.shared_cpu_cache_passive_allocator is None:
+            raise ValueError(
+                "Layerwise-prefill requires the passive shared CPU mapping"
+            )
+        for group, rows in enumerate(self._dsa_kv_topology_view.rows_by_group):
+            caches = [kv_caches[row[0]] for row in rows]
+            self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
+            if self.gpu_connector.get_num_layers(group) != len(rows):
+                raise ValueError("Layerwise-prefill connector layout is incomplete")
+
+    def layerwise_prefill_row_metadata(
+        self, group: int, num_tokens: int
+    ) -> tuple[torch.Size, torch.dtype, MemoryFormat]:
+        """Return the initialized one-row shape, dtype and plane-major format."""
+        return (
+            self.gpu_connector.get_shape(num_tokens, kv_group=group),
+            self.metadata.kv_dtype,
+            self._memory_format_for_kv_group(group),
+        )
+
+    def layerwise_prefill_ack(
+        self, identity: Any, error: Optional[Exception] = None
+    ) -> None:
+        """Acknowledge one synchronous phase on every TP CPU rank, or raise on all.
+
+        Unlike rank0's possibly one-way MQ broadcast, the CPU collective also
+        carries passive-rank failures. Call only outside graph capture.
+        """
+        status = (
+            identity,
+            None if error is None else f"{type(error).__name__}: {error}",
+            isinstance(error, LayerwisePrefillFenceError),
+        )
+        statuses = [status]
+        if self.metadata.world_size > 1:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            statuses = [None] * self.metadata.world_size
+            try:
+                torch.distributed.all_gather_object(
+                    statuses, status, group=get_tp_group().cpu_group
+                )
+            except Exception as exc:
+                raise LayerwisePrefillFenceError(
+                    "Layerwise-prefill TP acknowledgement failed; "
+                    "peer device completion is unknown"
+                ) from exc
+        failures = [
+            (rank, "identity mismatch" if item[0] != identity else None, item[1])
+            for rank, item in enumerate(statuses)
+            if item[0] != identity or item[1] is not None
+        ]
+        if failures:
+            failure_type = (
+                LayerwisePrefillFenceError
+                if any(item[2] for item in statuses)
+                else ValueError
+            )
+            raise failure_type(
+                f"Layerwise-prefill TP phase failed: {failures!r}"
+            ) from error
+
+    def resolve_layerwise_prefill_row(
+        self,
+        request_id: str,
+        generation: int,
+        group: int,
+        row: int,
+        keys: list[CacheEngineKey],
+        starts: list[int],
+        ends: list[int],
+        *,
+        phase: str,
+        memory_objs: Optional[list[MemoryObj]] = None,
+        error: Optional[Exception] = None,
+    ) -> list[MemoryObj]:
+        """Resolve/publish one complete row through existing shared CPU handles.
+
+        Rank0 may lend already-owned objects, otherwise the shared resolver
+        returns one reference and lifetime pin lease per object. Passive results
+        own one view reference and lifetime pin lease. Unverified bootstrap CPU
+        hits are republished to required remote storage before handles are sent.
+        The caller must acknowledge H2D on all TP ranks
+        before releasing any predecessor. Root errors are always published.
+        """
+        owned = memory_objs is None
+        objects = [] if owned or not self.metadata.is_first_rank() else memory_objs
+        envelope = None
+        try:
+            if self.metadata.is_first_rank():
+                try:
+                    if error is not None:
+                        raise error
+                    if owned and keys:
+                        locations = [self.storage_manager.contains(key) for key in keys]
+                        if any(location is None for location in locations):
+                            raise ValueError(
+                                "Missing required layerwise-prefill source chunk"
+                            )
+                        # Fetch outside the pin-lease scope: remote allocation
+                        # may need ordinary expired pins reclaimed by the monitor.
+                        # Caller references keep fetched objects alive until the
+                        # prefetched resolver acquires their lifetime pins.
+                        prefix = LocalCPUPrefixGetResult([None] * len(keys), [], [])
+                        try:
+                            for location in dict.fromkeys(locations):
+                                positions = [
+                                    i
+                                    for i, loc in enumerate(locations)
+                                    if loc == location
+                                ]
+                                batch = self.storage_manager.batched_get(
+                                    [keys[i] for i in positions], location=location
+                                )
+                                if len(batch) != len(positions):
+                                    for obj in batch:
+                                        if obj is not None:
+                                            obj.ref_count_down()
+                                    raise ValueError("Incomplete shared row fetch")
+                                for i, obj in zip(positions, batch, strict=True):
+                                    prefix.local_memory_objs[i] = obj
+                            prefix.validate(keys)
+                            with PinMonitor.GetOrCreate().protect_pins() as pins:
+                                objects = self._resolve_shared_rank0_layer_mem_objs(
+                                    req_id=request_id,
+                                    phase=phase,
+                                    layer_id=row,
+                                    kv_group=group,
+                                    keys_layer=keys,
+                                    local_prefix=prefix,
+                                )
+                                pins.extend(objects)
+                        finally:
+                            prefix.release()
+                        # A LocalCPU hit may be left by a failed remote put. Its
+                        # unmodified full chunks are not committed until this
+                        # host-only republication completes successfully.
+                        if self.config.remote_url is not None:
+                            for obj in objects:
+                                obj.ref_count_up()
+                            self.storage_manager.batched_put_sync_required(
+                                keys, objects, required_backends=("RemoteBackend",)
+                            )
+                    handles = (
+                        self._make_shared_handles_for_layer(
+                            req_id=request_id,
+                            phase=phase,
+                            keys_layer=keys,
+                            mem_objs_layer=objects,
+                            layer_id=row,
+                            kv_group=group,
+                        )
+                        if keys
+                        else []
+                    )
+                    envelope = SharedHandleEnvelope(
+                        request_id=request_id,
+                        request_ordinal=generation,
+                        phase=phase,
+                        layer_id=row,
+                        kv_group=group,
+                        generation=self.shared_cpu_cache_generation,
+                        status="ok" if keys else "skipped",
+                        handles=handles,
+                    )
+                except Exception as exc:
+                    error = exc
+                    envelope = self._shared_layerwise_error_envelope(
+                        req_id=request_id,
+                        phase=phase,
+                        request_ordinal=generation,
+                        layer_id=row,
+                        kv_group=group,
+                        message=str(exc),
+                    )
+                if self.metadata.world_size > 1:
+                    try:
+                        self._broadcast_shared_envelope(envelope)
+                    except Exception as exc:
+                        raise LayerwisePrefillFenceError(
+                            "Layerwise-prefill handle publication failed; "
+                            "peer device completion is unknown"
+                        ) from exc
+                if error is not None:
+                    raise error
+            else:
+                envelope = self._receive_shared_envelope()
+                self._validate_shared_layerwise_envelope(
+                    envelope,
+                    req_id=request_id,
+                    phase=phase,
+                    request_ordinal=generation,
+                    layer_id=row,
+                    kv_group=group,
+                )
+                if len(envelope.handles) != len(keys):
+                    raise ValueError("Layerwise-prefill shared row has missing handles")
+                objects = []
+                for index, (key, start, end, handle) in enumerate(
+                    zip(keys, starts, ends, envelope.handles, strict=True)
+                ):
+                    shape, dtype, fmt = self.layerwise_prefill_row_metadata(
+                        group, end - start
+                    )
+                    obj = self.shared_cpu_cache_passive_allocator.create_view(
+                        handle,
+                        expected_request_id=request_id,
+                        expected_phase=phase,
+                        expected_layer_id=row,
+                        expected_kv_group=group,
+                        expected_chunk_index=index,
+                        expected_key=key,
+                        expected_shape=shape,
+                        expected_dtype=dtype,
+                        expected_fmt=fmt,
+                        expected_cached_positions=range(start, end),
+                        expected_producer_rank=self.metadata.first_rank,
+                    )
+                    with PinMonitor.GetOrCreate().protect_pins() as pins:
+                        obj.pin()
+                        pins.append(obj)
+                    objects.append(obj)
+            return objects
+        except Exception as exc:
+            if owned or not self.metadata.is_first_rank():
+                if isinstance(exc, LayerwisePrefillFenceError):
+                    # Publication may have reached a peer whose H2D is still
+                    # reading these offsets. Retain ownership until restart.
+                    held = getattr(self, "_layerwise_prefill_uncertain_rows", [])
+                    self._layerwise_prefill_uncertain_rows = held + objects
+                else:
+                    for obj in objects:
+                        PinMonitor.GetOrCreate().release_pin_lease(obj)
+                        obj.ref_count_down()
+            raise
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
