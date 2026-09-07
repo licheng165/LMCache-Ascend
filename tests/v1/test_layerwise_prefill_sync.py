@@ -14,6 +14,7 @@ import multiprocessing
 
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
+from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.memory_management import TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
@@ -22,6 +23,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.token_database import ChunkedTokenDatabase
 import lmcache.v1.config as lmcache_config
+import lmcache.v1.gpu_connector.gpu_connectors as gpu_connectors_module
 import lmcache.v1.pin_monitor as pin_monitor_module
 import pytest
 import torch
@@ -35,6 +37,10 @@ from lmcache_ascend.v1.layerwise_prefill_sync import (
     LayerwisePrefillSyncBackend,
 )
 from lmcache_ascend.v1.layerwise_prefill_window import LayerwisePrefillNPUWindowBackend
+from lmcache_ascend.v1.npu_connector.npu_connectors import (
+    VLLMPagedMemLayerwiseNPUConnector,
+)
+from lmcache_ascend.v1.npu_connector.utils import permute_kv_caches_to_contiguous
 
 
 INDEXER_EXECUTIONS = (0, 1, 2, *range(6, 79, 4))
@@ -152,7 +158,8 @@ class CPUConnector:
         }
 
     def initialize_kvcaches_ptr(self, **kwargs: Any) -> None:
-        self.kvcaches = kwargs["kvcaches"]
+        # Exercise the production entry-container ABI, not a permissive copy.
+        GPUConnectorInterface.initialize_kvcaches_ptr(self, **kwargs)
 
     def _lazy_initialize_buffer(
         self, caches: list, *, kv_group: int, init_staging: bool
@@ -205,6 +212,13 @@ class CPUConnector:
 @pytest.fixture
 def runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    # --noconftest CPU runs do not install every Ascend monkeypatch. Match the
+    # production GPUConnectorInterface -> NPU permutation dispatch explicitly.
+    monkeypatch.setattr(
+        gpu_connectors_module,
+        "permute_kv_caches_to_contiguous",
+        permute_kv_caches_to_contiguous,
+    )
     thread = local()
     serving = SimpleNamespace(
         model_config=SimpleNamespace(enforce_eager=True),
@@ -350,6 +364,58 @@ def _registry(engine: Any) -> dict:
         for group, rows in enumerate(_view().rows_by_group)
         for row in rows
     }
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_bind_initializes_real_connector_without_copying_kv_planes(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, container: Any
+) -> None:
+    engine = runtime.engine()
+    registry = {name: container(planes) for name, planes in _registry(engine).items()}
+    connector = VLLMPagedMemLayerwiseNPUConnector.__new__(
+        VLLMPagedMemLayerwiseNPUConnector
+    )
+    connector.use_mla = connector.dsa_two_groups = True
+    connector.use_gpu = False
+    connector.lmcache_chunk_size = 256
+    connector._group_layouts = {}
+    connector._dsa_kv_topology_view = _view()
+    engine.gpu_connector = connector
+    normalized_groups = []
+
+    def normalize(caches: list) -> list:
+        assert all(isinstance(planes, tuple) for planes in caches)
+        result = permute_kv_caches_to_contiguous(caches)
+        normalized_groups.append(result)
+        for before, after in zip(caches, result, strict=True):
+            for src, dst in zip(before, after, strict=True):
+                assert dst.data_ptr() == src.data_ptr()
+                assert dst.stride() == src.stride()
+        return result
+
+    # Keep the actual GPUConnectorInterface initializer, Ascend permutation,
+    # format detection and per-group lazy initialization in the exercised path.
+    monkeypatch.setattr(
+        gpu_connectors_module, "permute_kv_caches_to_contiguous", normalize
+    )
+    backend = engine.layerwise_prefill_window_backend
+    backend.bind_step([_request()], registry)
+    assert [len(group) for group in normalized_groups] == [79, 22]
+    assert [connector.get_num_layers(group) for group in (0, 1)] == [79, 22]
+    assert [connector.get_shape(17, kv_group=group).numel() for group in (0, 1)] == [
+        34,
+        17,
+    ]
+    assert all(
+        layout.gpu_buffer_allocator is None
+        for layout in connector._group_layouts.values()
+    )
+    for name, planes in registry.items():
+        assert isinstance(planes, container)
+        assert isinstance(backend._caches[name], tuple)
+        assert all(
+            src is dst for src, dst in zip(planes, backend._caches[name], strict=True)
+        )
 
 
 def _step(engine: Any, backend: Any, requests: list) -> None:

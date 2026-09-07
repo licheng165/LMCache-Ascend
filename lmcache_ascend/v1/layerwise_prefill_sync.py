@@ -62,7 +62,7 @@ class LayerwisePrefillSyncBackend:
         self._history: dict[str, LayerwisePrefillRequest] = {}
         self._released: dict[str, int] = {}
         self._prefixes: dict[tuple[str, int, int, int], _RowPrefix] = {}
-        self._caches: dict[str, list[torch.Tensor]] = {}
+        self._caches: dict[str, tuple[torch.Tensor, ...]] = {}
         self._slots: dict[tuple[str, int, int], torch.Tensor] = {}
         self._plans: dict[tuple[str, int, int], list[tuple]] = {}
         self._saved = [0, 0]
@@ -543,8 +543,10 @@ class LayerwisePrefillSyncBackend:
         return starts, ends, keys
 
     @staticmethod
-    def _planes(value: Any, group: int) -> list[torch.Tensor]:
-        planes = list(value) if isinstance(value, (list, tuple)) else [value]
+    def _planes(value: Any, group: int) -> tuple[torch.Tensor, ...]:
+        # The registered-layer ABI uses tuples, including singleton INDEXER
+        # planes. Preserve tensor/storage identity when normalizing inputs.
+        planes = tuple(value) if isinstance(value, (list, tuple)) else (value,)
         if len(planes) != (2 if group == 0 else 1) or any(
             not isinstance(plane, torch.Tensor)
             or plane.dtype != torch.bfloat16
