@@ -84,7 +84,13 @@ class LayerwisePrefillDeviceOps:
         bank: int,
         metadata: Any,
     ) -> None:
-        """Block the compute stream until the row's H2D completed."""
+        """Make the row's required prefix ready on the compute stream.
+
+        With no prior load submission, restore the prefix synchronously,
+        including bootstrap and the next prefill chunk's own prefix. Raise
+        if that prefix cannot be restored; absence of an event is not proof
+        that the prefix is empty.
+        """
         raise NotImplementedError
 
     def finish_publish(
@@ -120,6 +126,8 @@ class LayerwisePrefillDeviceOps:
 class _BankLedger:
     save_done: Any = None
     load_done: Any = None
+    load_identity: Optional[tuple[int, tuple[tuple[str, int], ...]]] = None
+    ready_identity: Optional[tuple[int, tuple[tuple[str, int], ...]]] = None
 
 
 class LayerwisePrefillNPUWindowBackend:
@@ -138,7 +146,8 @@ class LayerwisePrefillNPUWindowBackend:
       paths serialize saves into their one staging tensor instead of
       pretending to have two banks.
     - Generation identity is validated before launch; stale-generation
-      completions clean their own resources and never touch current banks.
+      completions never publish or touch current banks. Release retires
+      request-owned records without discarding physical bank dependencies.
     """
 
     def __init__(
@@ -163,17 +172,24 @@ class LayerwisePrefillNPUWindowBackend:
         # wait on it before reusing their one staging tensor.
         self._group_last_submit_event: dict[int, Any] = {}
         self._active_generations: dict[str, int] = {}
-        self._aborted: set[str] = set()
+        # One high-water mark per released request, not a permanent ID ban.
+        self._released_generations: dict[str, int] = {}
 
     @property
     def supports_sync_callbacks(self) -> bool:
-        return callable(getattr(self._ops, "sync_save", None))
+        return self._has_concrete_hooks(("sync_save", "wait_for_load", "abort_request"))
 
     @property
     def supports_transfer_window(self) -> bool:
-        return callable(
-            getattr(self._ops, "submit_save", None)
-        ) and callable(getattr(self._ops, "submit_load", None))
+        return self._has_concrete_hooks(
+            (
+                "submit_save",
+                "submit_load",
+                "wait_for_load",
+                "finish_publish",
+                "abort_request",
+            )
+        )
 
     @property
     def persists_indexer_group(self) -> bool:
@@ -222,9 +238,10 @@ class LayerwisePrefillNPUWindowBackend:
             )
         return key, group, row_ordinal, key[4]
 
-    def _validate_launch(self, metadata: Any) -> tuple[tuple[str, int], ...]:
+    def _request_generations(self, metadata: Any) -> tuple[tuple[str, int], ...]:
         self._check_layout_rebind()
         generations = []
+        request_ids = set()
         for request_id, generation in metadata.request_generations:
             if (
                 not isinstance(request_id, str)
@@ -232,21 +249,32 @@ class LayerwisePrefillNPUWindowBackend:
                 or not isinstance(generation, int)
                 or isinstance(generation, bool)
                 or generation <= 0
+                or request_id in request_ids
             ):
                 raise ValueError(
                     "Layerwise-prefill backend requires valid request "
                     "generations before any device launch."
                 )
-            if request_id in self._aborted:
-                raise ValueError(
-                    "Layerwise-prefill backend refuses an aborted request: "
-                    f"{request_id!r}."
-                )
-            active = self._active_generations.get(request_id)
-            if active is None or generation > active:
-                self._active_generations[request_id] = generation
+            request_ids.add(request_id)
             generations.append((request_id, generation))
+        if not generations:
+            raise ValueError("Layerwise-prefill backend requires request generations.")
         return tuple(generations)
+
+    def _validate_launch(self, metadata: Any) -> tuple[tuple[str, int], ...]:
+        generations = self._request_generations(metadata)
+        for request_id, generation in generations:
+            if (
+                generation < self._active_generations.get(request_id, 0)
+                or generation <= self._released_generations.get(request_id, 0)
+            ):
+                raise ValueError(
+                    "Layerwise-prefill backend refuses a superseded or released "
+                    f"request generation: {request_id!r}/{generation}."
+                )
+        # Activation follows successful device submission/readiness. A failed
+        # newer restore must not invalidate the coordinator's older saves.
+        return generations
 
     def _check_layout_rebind(self) -> None:
         live = self._ops.layout_signature()
@@ -291,16 +319,27 @@ class LayerwisePrefillNPUWindowBackend:
         return banks
 
     def wait_for_load(self, metadata: Any) -> None:
-        """Wait until the metadata's row finished its H2D (compute stream)."""
+        """Restore/wait for a row, including sync and first-row bootstrap loads.
+
+        Stale generations raise before device work. Readiness is recorded only
+        after the device hook succeeds, and is invalidated by the next save/load.
+        """
 
         key, group, row_ordinal, bank = self._row(metadata)
+        generations = self._validate_launch(metadata)
         ledger = self._ledger(group, bank)
-        if ledger.load_done is None:
-            # Fresh rows with no retrievable content have nothing to wait
-            # for; the load ledger only tracks submitted H2D transfers.
+        identity = (row_ordinal, generations)
+        if ledger.load_identity is not None and ledger.load_identity != identity:
+            raise ValueError("Layerwise-prefill wait does not own the pending load.")
+        if ledger.ready_identity == identity:
             return
+        # No ledger is not proof of an empty prefix: the ops must restore it
+        # synchronously or fail closed, never silently skip bootstrap.
         self._ops.wait_for_load(group, row_ordinal, bank, metadata)
+        self._active_generations.update(generations)
         ledger.load_done = None
+        ledger.load_identity = None
+        ledger.ready_identity = identity
 
     def submit_save(
         self,
@@ -311,9 +350,8 @@ class LayerwisePrefillNPUWindowBackend:
         """Pre-HCOM: validate and enqueue one canonical row D2H save."""
 
         key, group, row_ordinal, bank = self._row(metadata)
-        generations = self._validate_launch(metadata)
         planes = self._kv_planes(group, kv_layer)
-        if row_ordinal in self._submitted.setdefault(group, {}):
+        if row_ordinal in self._submitted.get(group, {}):
             raise ValueError(
                 "Layerwise-prefill row was already submitted before its "
                 f"finish: group={group}, row={row_ordinal}."
@@ -324,6 +362,7 @@ class LayerwisePrefillNPUWindowBackend:
             wait_event = self._group_last_submit_event.get(group)
         else:
             wait_event = None
+        generations = self._validate_launch(metadata)
         done_event = self._event_factory()
         self._ops.submit_save(
             group,
@@ -334,15 +373,22 @@ class LayerwisePrefillNPUWindowBackend:
             wait_event=wait_event,
             done_event=done_event,
         )
+        self._active_generations.update(generations)
         self._group_last_submit_event[group] = done_event
-        self._submitted[group][row_ordinal] = (generations, done_event)
+        self._submitted.setdefault(group, {})[row_ordinal] = (generations, done_event)
+        # Physical bank dependencies survive supersession and release; a late
+        # finish must not replace the event of a newer save into this bank.
+        ledger = self._ledger(group, bank)
+        ledger.save_done = done_event
+        ledger.ready_identity = None
 
     def submit_load(self, metadata: Any) -> None:
         """Pre-HCOM: enqueue next-row H2D for every present group."""
 
-        self._validate_launch(metadata)
+        generations = self._validate_launch(metadata)
         execution = metadata.execution
         groups = (0,) if execution.indexer is None else (0, 1)
+        loads = []
         for group in groups:
             row = execution.latent if group == 0 else execution.indexer
             assert row is not None
@@ -351,6 +397,15 @@ class LayerwisePrefillNPUWindowBackend:
                 continue
             bank = next_row % 2
             ledger = self._ledger(group, bank)
+            identity = (next_row, generations)
+            if ledger.load_identity is not None:
+                if ledger.load_identity != identity:
+                    raise ValueError(
+                        "Layerwise-prefill load would replace a pending load."
+                    )
+                continue
+            loads.append((group, next_row, bank, ledger, identity))
+        for group, next_row, bank, ledger, identity in loads:
             # Load stream must wait for the previous save into this bank
             # before overwriting it.
             done_event = self._event_factory()
@@ -363,26 +418,40 @@ class LayerwisePrefillNPUWindowBackend:
                 done_event=done_event,
             )
             ledger.load_done = done_event
+            ledger.load_identity = identity
+            ledger.ready_identity = None
+        self._active_generations.update(generations)
 
     def finish_save(self, metadata: Any) -> Optional[Any]:
         """Post-HCOM: publish one submitted save and return its persist future."""
 
         key, group, row_ordinal, bank = self._row(metadata)
-        generations = self._validate_launch(metadata)
-        record = self._submitted.setdefault(group, {}).pop(row_ordinal, None)
-        if record is None:
+        generations = self._request_generations(metadata)
+        record = self._submitted.get(group, {}).get(row_ordinal)
+        if any(
+            generation < self._active_generations.get(request_id, 0)
+            or generation <= self._released_generations.get(request_id, 0)
+            for request_id, generation in generations
+        ):
+            if record is not None and record[0] == generations:
+                del self._submitted[group][row_ordinal]
+            return None
+        if record is None or any(
+            generation != self._active_generations.get(request_id)
+            for request_id, generation in generations
+        ):
             raise ValueError(
                 "Layerwise-prefill finish arrived before its submit: "
                 f"group={group}, row={row_ordinal}."
             )
         submitted_generations, done_event = record
         if submitted_generations != generations:
-            # Stale-generation completion: clean its own record, never
-            # publish for the current generation or touch current banks.
-            return None
-        ledger = self._ledger(group, bank)
-        ledger.save_done = done_event
-        return self._ops.finish_publish(metadata, done_event)
+            raise ValueError(
+                "Layerwise-prefill finish identity differs from its submit."
+            )
+        future = self._ops.finish_publish(metadata, done_event)
+        del self._submitted[group][row_ordinal]
+        return future
 
     def sync_save(
         self,
@@ -393,10 +462,44 @@ class LayerwisePrefillNPUWindowBackend:
         """Stage 3 contract: fully save one row in one call."""
 
         key, group, row_ordinal, bank = self._row(metadata)
-        self._validate_launch(metadata)
         planes = self._kv_planes(group, kv_layer)
+        generations = self._validate_launch(metadata)
         self._ops.sync_save(group, row_ordinal, bank, planes, attn_metadata)
+        self._active_generations.update(generations)
+        self._ledger(group, bank).ready_identity = None
 
     def abort_request(self, request_id: str) -> None:
-        self._aborted.add(request_id)
+        """Release request-owned records, blocking only known old generations."""
+
+        generation = self._active_generations.pop(request_id, 0)
+        self._released_generations[request_id] = max(
+            generation, self._released_generations.get(request_id, 0)
+        )
         self._ops.abort_request(request_id)
+        for rows in self._submitted.values():
+            for row, (generations, _) in tuple(rows.items()):
+                if any(req_id == request_id for req_id, _ in generations):
+                    del rows[row]
+        for ledgers in self._ledgers.values():
+            for ledger in ledgers.values():
+                # Retain physical events after request identity is retired.
+                if ledger.load_identity is not None and any(
+                    req_id == request_id for req_id, _ in ledger.load_identity[1]
+                ):
+                    ledger.load_identity = None
+                if ledger.ready_identity is not None and any(
+                    req_id == request_id for req_id, _ in ledger.ready_identity[1]
+                ):
+                    ledger.ready_identity = None
+
+    def _has_concrete_hooks(self, names: tuple[str, ...]) -> bool:
+        for name in names:
+            hook = getattr(self._ops, name, None)
+            if (
+                not callable(hook)
+                or getattr(hook, "__func__", hook)
+                is getattr(LayerwisePrefillDeviceOps, name)
+                or getattr(hook, "__isabstractmethod__", False)
+            ):
+                return False
+        return True

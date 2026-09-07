@@ -469,11 +469,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         if not callable(opt_in) or opt_in() is not True:
             return None
         ops = getattr(connector, "layerwise_prefill_device_ops", None)
-        if ops is None or not callable(
-            getattr(ops, "submit_save", None)
-        ):
+        if ops is None:
             return None
         backend = LayerwisePrefillNPUWindowBackend(view, ops)
+        if not backend.supports_transfer_window:
+            return None
         self._layerwise_prefill_window_backend = backend
         logger.info(
             "Layerwise-prefill P node: residency_mode=PREFILL_LAYERWISE "
