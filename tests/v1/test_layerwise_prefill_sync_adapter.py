@@ -116,6 +116,23 @@ def _make_adapter(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     return adapter
 
 
+def _make_tp_adapters(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    root = runtime.engine(size=2)
+    passive = runtime.engine(1, root, size=2)
+    adapters = []
+    for rank, engine in enumerate((root, passive)):
+        runtime.thread.rank = rank
+        adapters.append(
+            _make_adapter(
+                SimpleNamespace(
+                    engine=lambda engine=engine: engine, serving=runtime.serving
+                ),
+                monkeypatch,
+            )
+        )
+    return adapters
+
+
 @pytest.fixture
 def adapter_runtime(runtime: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     adapter = _make_adapter(runtime, monkeypatch)
@@ -222,7 +239,11 @@ def _start(
 
 def _save_rows(adapter: Any, requests: list, callbacks: list) -> None:
     engine = adapter.lmcache_engine
-    cpu = engine.storage_manager.local_cpu_backend
+    cpu = (
+        engine.storage_manager.local_cpu_backend
+        if engine.metadata.is_first_rank()
+        else None
+    )
     for metadata in callbacks:
         row = metadata.row
         group, ordinal, bank = row.kv_group, row.row_ordinal, row.bank
@@ -244,6 +265,8 @@ def _save_rows(adapter: Any, requests: list, callbacks: list) -> None:
         # all-layer saver would now read poison instead of this row's content.
         for plane in planes:
             plane.fill_(-100)
+        if cpu is None:
+            continue
         for req in requests:
             for start, end, key in engine.token_database.process_tokens(
                 list(req.token_ids[: req.compute_end]),
@@ -449,7 +472,7 @@ def test_same_id_replacement_releases_old_before_bind_not_new_on_get_finished(
     assert events.mock_calls == expected + [
         call.release("req-0"),
         call.abort("req-0"),
-        call.bind([replacement], adapter.kv_caches),
+        call.bind([replacement], adapter.kv_caches, validation_error=None),
     ]
     assert all(not obj.is_valid() for obj in old_objects)
     _save_rows(adapter, [replacement], callbacks[:1])

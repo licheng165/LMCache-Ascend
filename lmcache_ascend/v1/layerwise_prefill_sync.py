@@ -2,11 +2,12 @@
 """Synchronous shared-bank P residency with request-owned, complete CPU rows.
 
 This path deliberately has no transfer window, graph capture, or all-layer
-store/retrieve fallback. A successful callback means D2H, required storage
-futures, shared-handle publication and every TP rank's acknowledgement finished.
+device fallback. Row callbacks fence D2H and publish shared CPU handles on all
+TP ranks. Page-first remote persistence completes only at the final step barrier.
 """
 
 # Standard
+from concurrent.futures import Future
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from time import perf_counter
@@ -17,6 +18,7 @@ from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
 from lmcache.v1.pin_monitor import PinMonitor
 import torch
 
@@ -58,11 +60,16 @@ class LayerwisePrefillSyncBackend:
     supports_sync_callbacks = True
     supports_transfer_window = False
     persists_indexer_group = True
+    accepts_coordinator_validation_errors = True
 
     def __init__(self, engine: "AscendLMCacheEngine", view: DSAKVTopologyView) -> None:
         engine.validate_layerwise_prefill_sync(view)
         self._engine = engine
         self._view = view
+        self._page_first = mooncake_page_layout_enabled(engine.config)
+        self._step_future: Future | None = None
+        self._commit_starts: dict[str, int] = {}
+        self._pending_rows: dict[tuple[str, int, int, int], list[MemoryObj]] = {}
         self._required_backends = (
             ("RemoteBackend",) if engine.config.remote_url is not None else ()
         )
@@ -99,7 +106,11 @@ class LayerwisePrefillSyncBackend:
         return self._view.layer_counts[group]
 
     def bind_step(
-        self, requests: list[LayerwisePrefillRequest], kv_caches: dict[str, Any]
+        self,
+        requests: list[LayerwisePrefillRequest],
+        kv_caches: dict[str, Any],
+        *,
+        validation_error: Exception | None = None,
     ) -> None:
         """Freeze exact request/generation/range/bank bindings before any transfer.
 
@@ -112,11 +123,18 @@ class LayerwisePrefillSyncBackend:
         caches = {}
         slots = {}
         plans = {}
+        commit_starts = {}
         started = perf_counter()
         try:
+            if validation_error is not None:
+                raise validation_error
             if self._bound or self._failed:
                 raise ValueError(
                     "Previous layerwise-prefill step is unfinished or failed"
+                )
+            if mooncake_page_layout_enabled(self._engine.config) != self._page_first:
+                raise ValueError(
+                    "Layerwise-prefill page mode changed after capability freeze"
                 )
             if any(not isinstance(req, LayerwisePrefillRequest) for req in requests):
                 raise ValueError("Expected scheduler LayerwisePrefillRequest bindings")
@@ -174,6 +192,9 @@ class LayerwisePrefillSyncBackend:
                 if req.allocation_generation <= self._released.get(req.request_id, 0):
                     raise ValueError("Released layerwise-prefill allocation generation")
                 prior = self._history.get(req.request_id)
+                commit_starts[req.request_id] = (
+                    0 if prior is None else req.compute_start // 256 * 256
+                )
                 if prior is not None and (
                     req.allocation_generation < prior.allocation_generation
                     or req.compute_start != prior.compute_end
@@ -262,7 +283,8 @@ class LayerwisePrefillSyncBackend:
         except Exception as exc:
             error = exc
         self._engine.layerwise_prefill_ack(
-            ("bind", self._step + 1, frozen, plans), error
+            ("bind", self._step + 1, frozen, plans, self._page_first, commit_starts),
+            error,
         )
         for req in frozen:
             prior = self._history.get(req.request_id)
@@ -278,6 +300,8 @@ class LayerwisePrefillSyncBackend:
             self._history[req.request_id] = req
         self._requests, self._caches, self._slots = frozen, caches, slots
         self._plans = plans
+        self._commit_starts = commit_starts
+        self._step_future = Future() if self._page_first else None
         self._saved, self._ready = [0, 0], set()
         self._step += 1
         self._bound = True
@@ -286,10 +310,14 @@ class LayerwisePrefillSyncBackend:
         self._load_seconds = self._save_seconds = 0.0
         self._reused_rows = self._published_handles = 0
 
-    def wait_for_load(self, metadata: Any) -> None:
+    def wait_for_load(
+        self, metadata: Any, *, validation_error: Exception | None = None
+    ) -> None:
         """Restore this row's full prefix on ALL TP ranks, including own chunks."""
         started = perf_counter()
-        group, row, bank, name = self._validate(metadata, "load")
+        group, row, bank, name = self._validate(
+            metadata, "load", validation_error=validation_error
+        )
         if (group, row) in self._ready:
             self._load_seconds += perf_counter() - started
             return
@@ -301,12 +329,33 @@ class LayerwisePrefillSyncBackend:
             try:
                 if prior is None:
                     starts, ends, keys = self._plan(req, req.restore_end, group, row)
+                    if self._page_first and self._engine.metadata.is_first_rank():
+                        try:
+                            if identity not in self._pending_rows:
+                                sources = self._engine.resolve_layerwise_prefill_group(
+                                    req.request_id,
+                                    group,
+                                    self._plans[req.request_id, group, req.restore_end],
+                                    phase=f"prefill_load:{self._step}",
+                                )
+                                for i, source in enumerate(sources):
+                                    self._pending_rows[
+                                        req.request_id,
+                                        req.allocation_generation,
+                                        group,
+                                        i,
+                                    ] = source
+                            objects = self._pending_rows.pop(identity)
+                        except Exception as exc:
+                            error = exc
                     objects = self._engine.resolve_layerwise_prefill_row(
                         *identity,
                         keys,
                         starts,
                         ends,
                         phase=f"prefill_load:{self._step}",
+                        memory_objs=objects,
+                        error=error,
                     )
                     self._published_handles += len(keys)
                 else:
@@ -338,11 +387,22 @@ class LayerwisePrefillSyncBackend:
         self._load_seconds += perf_counter() - started
 
     def sync_save(
-        self, metadata: Any, kv_layer: Any, attn_metadata: Any = None
-    ) -> None:
-        """Persist changed suffix chunks, waiting storage futures before returning."""
+        self,
+        metadata: Any,
+        kv_layer: Any,
+        attn_metadata: Any = None,
+        *,
+        validation_error: Exception | None = None,
+    ) -> Future | None:
+        """Fence and publish changed CPU rows; page mode returns the step commit future.
+
+        The CPU source is complete synchronously, so banks may be reused on
+        return. Layer-key mode also waits remote persistence here and returns None.
+        """
         started = perf_counter()
-        group, row, bank, name = self._validate(metadata, "save", kv_layer)
+        group, row, bank, name = self._validate(
+            metadata, "save", kv_layer, validation_error=validation_error
+        )
         root = self._engine.metadata.is_first_rank()
         for req in self._requests:
             identity = (req.request_id, req.allocation_generation, group, row)
@@ -387,7 +447,13 @@ class LayerwisePrefillSyncBackend:
                     for obj in fresh:
                         obj.ref_count_up()
                     self._engine.storage_manager.batched_put_sync_required(
-                        keys[keep:], fresh, required_backends=self._required_backends
+                        keys[keep:],
+                        fresh,
+                        **(
+                            {"location": "LocalCPUBackend"}
+                            if self._page_first
+                            else {"required_backends": self._required_backends}
+                        ),
                     )
             except Exception as exc:
                 error = exc
@@ -427,9 +493,16 @@ class LayerwisePrefillSyncBackend:
         self._ready.remove((group, row))
         self._saved[group] += 1
         self._save_seconds += perf_counter() - started
+        return self._step_future
 
     def finish_step(self) -> None:
-        """Require all 79 LATENT and 22 INDEXER rows before the coordinator barrier."""
+        """Validate all rows on all TP ranks, then commit complete CPU page groups.
+
+        Page mode submits only changed chunks (the full prefix for a first
+        external hit), waits required remote futures, and resolves the shared
+        step future only after all ranks acknowledge commit. Any failure poisons
+        the step and completes its future exceptionally without logging success.
+        """
         error = None
         if (
             not self._bound
@@ -441,7 +514,112 @@ class LayerwisePrefillSyncBackend:
                 f"Incomplete layerwise-prefill step: saved={self._saved}, "
                 "expected=79/22"
             )
+        if self._page_first and error is None:
+            try:
+                if self._pending_rows:
+                    raise ValueError("Unpublished layerwise-prefill bootstrap rows")
+                for req in self._requests:
+                    keep = self._commit_starts[req.request_id] // 256
+                    for group, count in enumerate(self._view.layer_counts):
+                        plan = self._plans[req.request_id, group, req.compute_end]
+                        prefixes = [
+                            self._prefixes[
+                                req.request_id, req.allocation_generation, group, row
+                            ]
+                            for row in range(count)
+                        ]
+                        for prefix in prefixes:
+                            if (
+                                not (
+                                    len(prefix.starts)
+                                    == len(prefix.ends)
+                                    == len(prefix.keys)
+                                    == len(prefix.objects)
+                                    == len(plan)
+                                )
+                                or (prefix.starts and prefix.starts[0] != 0)
+                                or (prefix.ends[-1] if prefix.ends else 0)
+                                != req.compute_end
+                                or prefix.revision != self._step
+                                or prefix.slab_generation
+                                != self._engine.shared_cpu_cache_generation
+                            ):
+                                raise ValueError("Invalid page commit manifest")
+                        # Unchanged chunks retain trusted ownership and their
+                        # keys were checked at save. Validate only the publish
+                        # suffix; a first external hit deliberately starts at 0.
+                        for chunk in range(keep, len(plan)):
+                            start, end, key = plan[chunk]
+                            shape, dtype, fmt = (
+                                self._engine.layerwise_prefill_row_metadata(
+                                    group, end - start
+                                )
+                            )
+                            positions = torch.arange(start, end, dtype=torch.long)
+                            for row, prefix in enumerate(prefixes):
+                                if (
+                                    prefix.starts[chunk] != start
+                                    or prefix.ends[chunk] != end
+                                    or prefix.keys[chunk] != key.get_layer(row)
+                                ):
+                                    raise ValueError("Invalid page commit manifest")
+                                obj = prefix.objects[chunk]
+                                if (
+                                    not obj.is_valid()
+                                    or obj.metadata.pin_count < 1
+                                    or (
+                                        obj.get_shape(),
+                                        obj.get_dtype(),
+                                        obj.get_memory_format(),
+                                    )
+                                    != (shape, dtype, fmt)
+                                    or obj.metadata.cached_positions is None
+                                    or not torch.equal(
+                                        obj.metadata.cached_positions, positions
+                                    )
+                                ):
+                                    raise ValueError(
+                                        "Invalid page commit source metadata"
+                                    )
+            except Exception as exc:
+                error = exc
         self._ack(("finish",), error)
+        persist_started = perf_counter()
+        pages = 0
+        if self._page_first:
+            error = None
+            try:
+                if self._engine.metadata.is_first_rank():
+                    for req in self._requests:
+                        keep = self._commit_starts[req.request_id] // 256
+                        for group, count in enumerate(self._view.layer_counts):
+                            plan = self._plans[req.request_id, group, req.compute_end]
+                            for base in range(keep, len(plan), 16):
+                                keys, objects = [], []
+                                for chunk in range(base, min(base + 16, len(plan))):
+                                    pages += plan[chunk][1] - plan[chunk][0] == 256
+                                    for row in range(count):
+                                        prefix = self._prefixes[
+                                            req.request_id,
+                                            req.allocation_generation,
+                                            group,
+                                            row,
+                                        ]
+                                        keys.append(prefix.keys[chunk])
+                                        objects.append(prefix.objects[chunk])
+                                for obj in objects:
+                                    obj.ref_count_up()
+                                self._engine.storage_manager.batched_put_sync_required(
+                                    keys,
+                                    objects,
+                                    required_backends=("RemoteBackend",),
+                                    location="RemoteBackend",
+                                )
+            except Exception as exc:
+                error = exc
+            self._ack(("commit",), error)
+            self._step_future.set_result(None)
+        persist_seconds = perf_counter() - persist_started
         # Host-observed wall times include synchronization waits, not isolated
         # NPU kernel time. Emit no per-layer records or diagnostic device reads.
         if self._engine.metadata.is_first_rank():
@@ -450,7 +628,7 @@ class LayerwisePrefillSyncBackend:
                 "[PREFILL_SYNC_STEP] event=end step=%d requests=%d saved=%s "
                 "elapsed_ms=%.3f bind_ms=%.3f load_ms=%.3f save_ms=%.3f "
                 "other_ms=%.3f reused_rows=%d published_handles=%d "
-                "completed_ends=%s",
+                "completed_ends=%s page_persist_ms=%.3f pages=%d",
                 self._step,
                 len(self._requests),
                 tuple(self._saved),
@@ -469,14 +647,22 @@ class LayerwisePrefillSyncBackend:
                 self._reused_rows,
                 self._published_handles,
                 [(req.request_id, req.compute_end) for req in self._requests],
+                persist_seconds * 1000 if self._page_first else 0.0,
+                pages,
             )
         self._bound = False
         self._requests = ()
         self._slots.clear()
         self._plans.clear()
+        self._commit_starts.clear()
 
     def abort_request(self, request_id: str) -> None:
         """Release a completed or aborted request's retained row references/pins."""
+        if any(req.request_id == request_id for req in self._requests):
+            if self._step_future is not None and not self._step_future.done():
+                self._step_future.set_exception(
+                    ValueError("Layerwise-prefill step aborted")
+                )
         if self._unsafe_transfer:
             raise LayerwisePrefillFenceError(
                 "Cannot release shared CPU rows after a failed device fence; "
@@ -490,22 +676,33 @@ class LayerwisePrefillSyncBackend:
         for identity in tuple(self._prefixes):
             if identity[0] == request_id:
                 self._release(self._prefixes.pop(identity).objects)
+        for identity in tuple(self._pending_rows):
+            if identity[0] == request_id:
+                self._release(self._pending_rows.pop(identity))
         if any(req.request_id == request_id for req in self._requests):
             self._failed = True
         if not self._history:
             self._requests = ()
             self._slots.clear()
             self._plans.clear()
+            self._commit_starts.clear()
             self._bound = self._failed = False
 
     def _validate(
-        self, metadata: Any, phase: str, kv_layer: Any = None
+        self,
+        metadata: Any,
+        phase: str,
+        kv_layer: Any = None,
+        *,
+        validation_error: Exception | None = None,
     ) -> tuple[int, int, int, str]:
         error = None
         key = None
         manifests = []
         ready = False
         try:
+            if validation_error is not None:
+                raise validation_error
             if not self._bound or self._failed or not self._requests:
                 raise ValueError("Layerwise-prefill callback has no live bound step")
             row = metadata.row
@@ -613,6 +810,14 @@ class LayerwisePrefillSyncBackend:
             self._failed = True
             if isinstance(exc, LayerwisePrefillFenceError):
                 self._unsafe_transfer = True
+            if self._step_future is not None and not self._step_future.done():
+                self._step_future.set_exception(exc)
+            for objects in self._pending_rows.values():
+                if self._unsafe_transfer:
+                    self._quarantined.extend(objects)
+                else:
+                    self._release(objects)
+            self._pending_rows.clear()
             raise
 
     def _transfer(

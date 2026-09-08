@@ -51,6 +51,7 @@ from lmcache.v1.shared_cpu_cache import (
     SharedHandleEnvelope,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
+from lmcache.v1.storage_backend.connector.base_connector import resolve_save_chunk_meta
 from lmcache.v1.token_database import TokenDatabase
 import torch
 
@@ -558,10 +559,31 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "strict shared LocalCPU, rank0-only stores, chunk_size=256, "
                 "save_unfull_chunk=true and store_async=false"
             )
-        if mooncake_page_layout_enabled(config) or mooncake_layer_pages_enabled(config):
+        if config.get_extra_config_value(
+            "mooncake_layer_merged_page_objects", False
+        ) or config.get_extra_config_value("mooncake_direct_npu_prefill_store", False):
             raise ValueError(
-                "Layerwise-prefill sync does not support page-first/merged pages"
+                "Layerwise-prefill sync does not support merged pages "
+                "or direct NPU store"
             )
+        if mooncake_page_layout_enabled(config):
+            if (
+                not str(config.remote_url).startswith("mooncakestore://")
+                or config.remote_serde != "naive"
+                or resolve_save_chunk_meta(config)
+            ):
+                raise ValueError(
+                    "Layerwise-prefill page-first requires Mooncake, "
+                    "remote_serde=naive and save_chunk_meta=false"
+                )
+            if metadata.is_first_rank():
+                remote = self.storage_manager.storage_backends.get("RemoteBackend")
+                connection = getattr(remote, "connection", None)
+                capability = getattr(connection, "supports_page_first", None)
+                if not callable(capability) or capability() is not True:
+                    raise ValueError(
+                        "Layerwise-prefill requires a live page-first RemoteBackend"
+                    )
         if not callable(
             getattr(self.gpu_connector, "transfer_layerwise_prefill_row", None)
         ):
@@ -639,6 +661,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._ensure_layerwise_connector_layout(kvcaches=caches, kv_group=group)
             if self.gpu_connector.get_num_layers(group) != len(rows):
                 raise ValueError("Layerwise-prefill connector layout is incomplete")
+        if self.metadata.is_first_rank() and mooncake_page_layout_enabled(self.config):
+            remote = self.storage_manager.storage_backends.get("RemoteBackend")
+            connection = getattr(remote, "connection", None)
+            if connection is None:
+                raise ValueError("Page-first layout requires a connected RemoteBackend")
+            for group, count in enumerate(self._dsa_kv_topology_view.layer_counts):
+                connection.validate_page_first_layout(
+                    group, count, *self.layerwise_prefill_row_metadata(group, 256)
+                )
 
     def layerwise_prefill_row_metadata(
         self, group: int, num_tokens: int
@@ -692,6 +723,120 @@ class AscendLMCacheEngine(LMCacheEngine):
                 f"Layerwise-prefill TP phase failed: {failures!r}"
             ) from error
 
+    def resolve_layerwise_prefill_group(
+        self,
+        request_id: str,
+        group: int,
+        plan: list[tuple[int, int, CacheEngineKey]],
+        *,
+        phase: str,
+    ) -> list[list[MemoryObj]]:
+        """Fetch a complete CPU group on rank0 without publishing any row handles.
+
+        Reads are bounded to 16 token chunks, never split across layers. A missing
+        LocalCPU row fetches its entire chunk group so page-only remote data can
+        be resolved. Returned rows own references and lifetime pin leases; the
+        caller must retain them until row publication/adoption or release them.
+        Missing/invalid pages or tails fail closed and release all acquired owners.
+        """
+        if not self.metadata.is_first_rank() or not mooncake_page_layout_enabled(
+            self.config
+        ):
+            raise ValueError("Page-first group resolution is rank0-only")
+        count = self._dsa_kv_topology_view.layer_counts[group]
+        resolved: list[list[MemoryObj]] = [[] for _ in range(count)]
+        try:
+            for base in range(0, len(plan), 16):
+                batch_plan = plan[base : base + 16]
+                keys = [
+                    key.get_layer(row)
+                    for _, _, key in batch_plan
+                    for row in range(count)
+                ]
+                batch = self.storage_manager.batched_get(
+                    keys, location="LocalCPUBackend"
+                )
+                try:
+                    if len(batch) != len(keys):
+                        raise ValueError("Incomplete LocalCPU group fetch")
+                    missing = [
+                        i
+                        for chunk in range(len(batch_plan))
+                        if any(
+                            obj is None
+                            for obj in batch[chunk * count : (chunk + 1) * count]
+                        )
+                        for i in range(chunk * count, (chunk + 1) * count)
+                    ]
+                    if missing:
+                        # No protect_pins scope may span remote I/O: allocation
+                        # can depend on the pin monitor reclaiming expired pins.
+                        fetched = self.storage_manager.batched_get(
+                            [keys[i] for i in missing], location="RemoteBackend"
+                        )
+                        if len(fetched) != len(missing):
+                            for obj in fetched:
+                                if obj is not None:
+                                    obj.ref_count_down()
+                            raise ValueError("Incomplete remote group fetch")
+                        for i, obj in zip(missing, fetched, strict=True):
+                            if batch[i] is not None:
+                                batch[i].ref_count_down()
+                            batch[i] = obj
+                    if any(obj is None for obj in batch):
+                        raise ValueError("Missing required layerwise-prefill page/tail")
+                    for chunk, (start, end, _) in enumerate(batch_plan):
+                        shape, dtype, fmt = self.layerwise_prefill_row_metadata(
+                            group, end - start
+                        )
+                        expected_positions = torch.arange(start, end, dtype=torch.long)
+                        for obj in batch[chunk * count : (chunk + 1) * count]:
+                            if (
+                                obj.get_shape(),
+                                obj.get_dtype(),
+                                obj.get_memory_format(),
+                            ) != (shape, dtype, fmt):
+                                raise ValueError(
+                                    "Invalid layerwise-prefill page/tail metadata"
+                                )
+                            positions = obj.metadata.cached_positions
+                            if positions is not None and not torch.equal(
+                                positions, expected_positions
+                            ):
+                                raise ValueError(
+                                    "Invalid layerwise-prefill cached positions"
+                                )
+                            if positions is None:
+                                obj.metadata.cached_positions = expected_positions
+                    for row in range(count):
+                        prefix = LocalCPUPrefixGetResult(batch[row::count], [], [])
+                        batch[row::count] = [None] * len(batch_plan)
+                        try:
+                            with PinMonitor.GetOrCreate().protect_pins() as pins:
+                                objects = self._resolve_shared_rank0_layer_mem_objs(
+                                    req_id=request_id,
+                                    phase=phase,
+                                    layer_id=row,
+                                    kv_group=group,
+                                    keys_layer=keys[row::count],
+                                    local_prefix=prefix,
+                                )
+                                pins.extend(objects)
+                            resolved[row].extend(objects)
+                        finally:
+                            prefix.release()
+                finally:
+                    for obj in batch:
+                        if obj is not None:
+                            obj.ref_count_down()
+            return resolved
+        except Exception:
+            for objects in resolved:
+                for obj in objects:
+                    PinMonitor.GetOrCreate().release_pin_lease(obj)
+                    obj.ref_count_down()
+            raise
+
     def resolve_layerwise_prefill_row(
         self,
         request_id: str,
@@ -710,8 +855,10 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         Rank0 may lend already-owned objects, otherwise the shared resolver
         returns one reference and lifetime pin lease per object. Passive results
-        own one view reference and lifetime pin lease. Unverified bootstrap CPU
-        hits are republished to required remote storage before handles are sent.
+        own one view reference and lifetime pin lease. In layer-key mode,
+        unverified bootstrap CPU hits are republished remotely before handles
+        are sent. Page mode requires borrowed complete-group sources instead;
+        the backend commits those groups at its final step barrier.
         The caller must acknowledge H2D on all TP ranks
         before releasing any predecessor. Root errors are always published.
         """
@@ -724,6 +871,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     if error is not None:
                         raise error
                     if owned and keys:
+                        if mooncake_page_layout_enabled(self.config):
+                            raise ValueError(
+                                "Page-first bootstrap requires a complete group source"
+                            )
                         locations = [self.storage_manager.contains(key) for key in keys]
                         if any(location is None for location in locations):
                             raise ValueError(
