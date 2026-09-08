@@ -45,6 +45,7 @@ from lmcache_ascend.v1.npu_connector.npu_connectors import (
 # Local
 from tests.v1.test_layerwise_prefill_sync import (
     _metadata,
+    _patch_cpu_slot_preparer,
     _registry,
     _request,
     _sentinel,
@@ -268,8 +269,11 @@ def test_page_adapter_end_only_commit_partial_successor_and_warm_reuse(
                 Mock(side_effect=AssertionError("warm group")),
             )
         before = len(store.puts)
+        prepared_before = len(engine.gpu_connector.prepared)
         callbacks = _start(adapter, requests, final=bool(start))
+        assert len(engine.gpu_connector.prepared) - prepared_before == 4 * request_count
         _save_rows(adapter, requests, callbacks)
+        assert len(engine.gpu_connector.prepared) - prepared_before == 4 * request_count
         assert len(store.puts) == before
         assert not store.gets
         assert all(
@@ -278,6 +282,8 @@ def test_page_adapter_end_only_commit_partial_successor_and_warm_reuse(
         )
         assert adapter.get_completed_decode_window_saves() == {}
         adapter.wait_for_save()
+        assert not adapter._layerwise_prefill_backend._slots
+        assert all(ref() is None for ref in engine.gpu_connector.prepared)
         assert all(
             adapter.layerwise_prefill_request_persist_done(req.request_id)
             for req in requests
@@ -376,6 +382,8 @@ def test_page_tp_commit_waits_and_failure_never_commits(
         for backend in (rb, pb)
     ]
     assert all(isinstance(future, Future) and not future.done() for future in futures)
+    for engine, backend in ((root, rb), (passive, pb)):
+        assert len(engine.gpu_connector.prepared) == len(backend._slots) == 4
     store = page_runtime.store
     assert not store.puts
     assert all(
@@ -424,6 +432,7 @@ def test_page_tp_commit_waits_and_failure_never_commits(
         store.gate.set()
         committed.result(20)
     assert all(future.done() for future in futures)
+    assert not rb._slots and not pb._slots
     assert all(
         (future.exception() is None) == (failure == "success") for future in futures
     )
@@ -1118,6 +1127,7 @@ def test_page_layout_failure_is_acknowledged_on_all_tp_ranks(page_runtime: Any) 
 
 def test_page_abi_matches_initialized_production_npu_row_shapes(
     page_runtime: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = page_runtime.engine()
     registry = _registry(engine)
@@ -1128,7 +1138,9 @@ def test_page_abi_matches_initialized_production_npu_row_shapes(
     connector._group_layouts = {}
     connector._dsa_kv_topology_view = _view()
     engine.gpu_connector = connector
+    sentinel = _patch_cpu_slot_preparer(monkeypatch, connector, registry)
     engine.layerwise_prefill_window_backend.bind_step([_request()], registry)
+    assert len(sentinel.prepared) == 4
     assert [connector.get_num_layers(group) for group in (0, 1)] == [79, 22]
     assert [connector.get_shape(256, kv_group=group) for group in (0, 1)] == [
         torch.Size([512]),

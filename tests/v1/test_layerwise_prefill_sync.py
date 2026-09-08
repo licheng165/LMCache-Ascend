@@ -5,13 +5,16 @@
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from queue import Queue
 from threading import Barrier, Event, Lock, local
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
+import gc
 import multiprocessing
+import weakref
 
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
@@ -142,12 +145,21 @@ def _sentinel(
     ).to(torch.bfloat16)
 
 
+@dataclass(eq=False)
+class _CPUSlotPlan:
+    snapshot: torch.Tensor
+    group: int
+    capacity: int
+
+
 class CPUConnector:
     """Exact packed-plane transfer, with all rows aliasing two recyclable banks."""
 
     def __init__(self, blocks: int = 64) -> None:
         self.layouts = {}
         self.calls = []
+        self.prepared = []
+        self.plan_uses = Counter()
         self.fail_load = False
         self.fail_store = False
         self.planes = {
@@ -182,7 +194,49 @@ class CPUConnector:
     def synchronize_shared_cpu_store_publication(self) -> None:
         pass
 
+    def prepare_layerwise_prefill_slots(
+        self, mapping: torch.Tensor, *, kv_group: int, capacity: int
+    ) -> _CPUSlotPlan:
+        assert [self.get_num_layers(group) for group in (0, 1)] == [79, 22]
+        assert mapping.device.type == "cpu" and mapping.dtype == torch.long
+        assert mapping.ndim == 1 and mapping.is_contiguous()
+        plane = self.planes[kv_group][0]
+        assert capacity == plane.shape[0] * plane.shape[1]
+        assert bool(((mapping >= 0) & (mapping < capacity)).all())
+        plan = _CPUSlotPlan(mapping.clone(), kv_group, capacity)
+        self.prepared.append(weakref.ref(plan))
+        return plan
+
     def transfer_layerwise_prefill_row(
+        self,
+        kv_layer: list,
+        cpu_chunks: list,
+        starts: list,
+        ends: list,
+        plan: _CPUSlotPlan,
+        /,
+        *,
+        kv_group: int,
+        direction: bool,
+    ) -> None:
+        # The backend must pass the exact opaque return value positionally.
+        prepared = [
+            i for i, reference in enumerate(self.prepared) if reference() is plan
+        ]
+        assert len(prepared) == 1
+        assert plan.group == kv_group
+        self.plan_uses[prepared[0], direction] += 1
+        self._transfer_cpu_row(
+            kv_layer,
+            cpu_chunks,
+            starts,
+            ends,
+            plan.snapshot,
+            kv_group=kv_group,
+            direction=direction,
+        )
+
+    def _transfer_cpu_row(
         self,
         kv_layer: list,
         cpu_chunks: list,
@@ -376,6 +430,23 @@ def _registry(engine: Any) -> dict:
     }
 
 
+def _patch_cpu_slot_preparer(
+    monkeypatch: pytest.MonkeyPatch, connector: Any, registry: dict
+) -> CPUConnector:
+    """Keep real layout initialization, replacing only the NPU-only preparation."""
+    sentinel = CPUConnector()
+    sentinel.planes = {
+        group: registry[rows[0][0]] for group, rows in enumerate(_view().rows_by_group)
+    }
+    monkeypatch.setattr(sentinel, "get_num_layers", connector.get_num_layers)
+    monkeypatch.setattr(
+        connector,
+        "prepare_layerwise_prefill_slots",
+        sentinel.prepare_layerwise_prefill_slots,
+    )
+    return sentinel
+
+
 @pytest.mark.parametrize("container", [list, tuple])
 def test_bind_initializes_real_connector_without_copying_kv_planes(
     runtime: Any, monkeypatch: pytest.MonkeyPatch, container: Any
@@ -408,8 +479,11 @@ def test_bind_initializes_real_connector_without_copying_kv_planes(
     monkeypatch.setattr(
         gpu_connectors_module, "permute_kv_caches_to_contiguous", normalize
     )
+    sentinel = _patch_cpu_slot_preparer(monkeypatch, connector, registry)
     backend = engine.layerwise_prefill_window_backend
     backend.bind_step([_request()], registry)
+    assert len(sentinel.prepared) == 4
+    assert all(isinstance(plan, _CPUSlotPlan) for plan in backend._slots.values())
     assert [len(group) for group in normalized_groups] == [79, 22]
     assert [connector.get_num_layers(group) for group in (0, 1)] == [79, 22]
     assert [connector.get_shape(17, kv_group=group).numel() for group in (0, 1)] == [
@@ -478,6 +552,138 @@ def _count_manifest_sources(
     if not engine.metadata.is_first_rank():
         track(engine.shared_cpu_cache_passive_allocator, "create_view", "views")
     return counts
+
+
+@pytest.mark.parametrize("request_count", [1, 4])
+def test_bind_builds_common_cpu_slot_arithmetic_once_per_request(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, request_count: int
+) -> None:
+    engine = runtime.engine()
+    backend = engine.layerwise_prefill_window_backend
+    requests = [_request(i) for i in range(request_count)]
+    positions = Mock(wraps=torch.arange)
+    arithmetic = Counter()
+    divide, modulo = torch.Tensor.__floordiv__, torch.Tensor.__mod__
+
+    def block_indices(tensor: torch.Tensor, size: int) -> torch.Tensor:
+        arithmetic["divide"] += 1
+        assert tensor.device.type == "cpu"
+        return divide(tensor, size)
+
+    def block_offsets(tensor: torch.Tensor, size: int) -> torch.Tensor:
+        arithmetic["modulo"] += 1
+        assert tensor.device.type == "cpu"
+        return modulo(tensor, size)
+
+    with monkeypatch.context() as bind:
+        bind.setattr(torch, "arange", positions)
+        bind.setattr(torch.Tensor, "__floordiv__", block_indices)
+        bind.setattr(torch.Tensor, "__mod__", block_offsets)
+        backend.bind_step(requests, _registry(engine))
+    assert positions.call_count == request_count
+    assert arithmetic == Counter(divide=request_count, modulo=request_count)
+    for call, req in zip(positions.call_args_list, requests, strict=True):
+        assert call.args == (req.compute_end,)
+        assert call.kwargs == {"dtype": torch.long, "device": "cpu"}
+    assert len(engine.gpu_connector.prepared) == 4 * request_count
+    assert len(backend._slots) == 4 * request_count
+    for req in requests:
+        for bank in (0, 1):
+            for group in (0, 1):
+                plan = backend._slots[req.request_id, bank, group]
+                assert plan.group == group and plan.capacity == 64 * 128
+                assert torch.equal(
+                    plan.snapshot, _slots(req, bank, group, req.compute_end)
+                )
+    assert not engine.gpu_connector.calls
+
+
+@pytest.mark.parametrize("prepare_hook", ["absent", "noncallable"])
+def test_connector_without_preparer_keeps_cpu_tensor_transfer_contract(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, prepare_hook: str
+) -> None:
+    engine = runtime.engine()
+    connector = engine.gpu_connector
+    if prepare_hook == "absent":
+        monkeypatch.delattr(CPUConnector, "prepare_layerwise_prefill_slots")
+    else:
+        monkeypatch.setattr(connector, "prepare_layerwise_prefill_slots", None)
+    monkeypatch.setattr(
+        connector, "transfer_layerwise_prefill_row", connector._transfer_cpu_row
+    )
+    backend = engine.layerwise_prefill_window_backend
+    _step(engine, backend, [_request()])
+    _step(engine, backend, [_request(start=300, end=530)])
+    assert not connector.prepared and not connector.plan_uses
+    assert backend._prepared_slot_count == 0
+    assert Counter(call[0] for call in connector.calls) == {True: 202, False: 101}
+
+
+@pytest.mark.parametrize("request_count", [1, 4])
+@pytest.mark.parametrize("save_row", [False, True])
+def test_abort_releases_bound_slot_plans(
+    runtime: Any, request_count: int, save_row: bool
+) -> None:
+    engine = runtime.engine()
+    backend = engine.layerwise_prefill_window_backend
+    requests = [_request(i) for i in range(request_count)]
+    registry = _registry(engine)
+    backend.bind_step(requests, registry)
+    refs = list(engine.gpu_connector.prepared)
+    assert len(refs) == 4 * request_count and all(ref() is not None for ref in refs)
+    if save_row:
+        metadata = _metadata(_view(), _view().rows_by_group[0][0], requests)
+        backend.wait_for_load(metadata)
+        backend.sync_save(metadata, registry[metadata.row.layer_name])
+    for req in requests:
+        backend.abort_request(req.request_id)
+    assert not backend._slots and not backend._plans and not backend._requests
+    assert all(ref() is None for ref in refs)
+    assert not backend._bound and not backend._prefixes
+
+
+@pytest.mark.parametrize("bad_rank", [0, 1])
+@pytest.mark.parametrize("fail_at", [0, 3])
+def test_slot_preparation_failure_reaches_all_tp_before_row_transfer(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, bad_rank: int, fail_at: int
+) -> None:
+    root = runtime.engine(size=2)
+    passive = runtime.engine(1, root, size=2)
+    engines = (root, passive)
+    backends = []
+    for rank, engine in enumerate(engines):
+        runtime.thread.rank = rank
+        backends.append(engine.layerwise_prefill_window_backend)
+    connector = engines[bad_rank].gpu_connector
+    prepare = connector.prepare_layerwise_prefill_slots
+
+    def fail(mapping: torch.Tensor, *, kv_group: int, capacity: int) -> Any:
+        if len(connector.prepared) == fail_at:
+            raise RuntimeError("slot preparation sentinel failure")
+        return prepare(mapping, kv_group=kv_group, capacity=capacity)
+
+    monkeypatch.setattr(connector, "prepare_layerwise_prefill_slots", fail)
+    counts = [
+        _count_manifest_sources(monkeypatch, engine, backend)
+        for engine, backend in zip(engines, backends, strict=True)
+    ]
+
+    def bind(rank: int) -> None:
+        backend = backends[rank]
+        with pytest.raises(ValueError, match="slot preparation sentinel failure"):
+            backend.bind_step([_request()], _registry(engines[rank]))
+        assert not backend._bound and not backend._slots and not backend._prefixes
+
+    runtime.parallel(lambda: bind(0), lambda: bind(1))
+    assert counts == [Counter(acks=1), Counter(acks=1)]
+    # Exception tracebacks can temporarily own the rejected bind's local plans.
+    gc.collect()
+    for rank, engine in enumerate(engines):
+        assert not engine.gpu_connector.calls
+        refs = engine.gpu_connector.prepared
+        assert len(refs) == (fail_at if rank == bad_rank else 4)
+        assert all(ref() is None for ref in refs)
+    assert not root.storage_manager.local_cpu_backend.hot_cache
 
 
 @pytest.mark.parametrize("request_count", [1, 4])
@@ -641,23 +847,46 @@ def test_sync_save_waits_required_future(runtime: Any, failure: bool) -> None:
     )
 
 
-def test_tp_passive_restores_every_row_but_never_stores(runtime: Any) -> None:
+@pytest.mark.parametrize("request_count", [1, 4])
+def test_tp_passive_restores_every_row_but_never_stores(
+    runtime: Any, request_count: int
+) -> None:
     root = runtime.engine(size=2)
     passive = runtime.engine(1, root, size=2)
     runtime.thread.rank = 0
     root_backend = root.layerwise_prefill_window_backend
     runtime.thread.rank = 1
     passive_backend = passive.layerwise_prefill_window_backend
-    for start, end in ((0, 300), (300, 530)):
-        requests = [_request(index, start, end) for index in range(4)]
+    for step, (start, end) in enumerate(((0, 300), (300, 530))):
+        requests = [
+            _request(index, start, end, generation=step + 1)
+            for index in range(request_count)
+        ]
         runtime.parallel(
             lambda requests=requests: _step(root, root_backend, requests),
             lambda requests=requests: _step(passive, passive_backend, requests),
         )
-    assert len(passive.gpu_connector.calls) == 4 * 101
+        for engine, backend in ((root, root_backend), (passive, passive_backend)):
+            connector = engine.gpu_connector
+            assert len(connector.prepared) == (step + 1) * request_count * 4
+            assert not backend._slots
+            assert all(ref() is None for ref in connector.prepared)
+            rows_per_bank = Counter(
+                (row[4], group)
+                for group, rows in enumerate(_view().rows_by_group)
+                for row in rows
+            )
+            for index in range(step * request_count * 4, len(connector.prepared)):
+                bank, group = divmod(index % 4, 2)
+                rows = rows_per_bank[bank, group]
+                assert connector.plan_uses[index, False] == (rows if step else 0)
+                assert connector.plan_uses[index, True] == (
+                    rows if engine is root else 0
+                )
+    assert len(passive.gpu_connector.calls) == request_count * 101
     assert all(not call[0] for call in passive.gpu_connector.calls)
-    assert sum(call[0] for call in root.gpu_connector.calls) == 8 * 101
-    for index in range(4):
+    assert sum(call[0] for call in root.gpu_connector.calls) == 2 * request_count * 101
+    for index in range(request_count):
         root_backend.abort_request(f"req-{index}")
         passive_backend.abort_request(f"req-{index}")
     assert all(
@@ -666,34 +895,117 @@ def test_tp_passive_restores_every_row_but_never_stores(runtime: Any) -> None:
     )
 
 
-def test_step_progress_is_root_only_and_reports_completed_extent(
-    runtime: Any, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("capability", [None, False, 1, "true", True])
+def test_step_progress_is_root_only_and_resets_timing_parts(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, capability: Any
 ) -> None:
+    """Injected host seconds test accounting, not NPU performance."""
     root = runtime.engine(size=2)
     passive = runtime.engine(1, root, size=2)
+    clock = [0.0, 0.0]
+    monkeypatch.setattr(sync_module, "perf_counter", lambda: clock[runtime.thread.rank])
+
+    def instrument(engine: Any) -> Any:
+        rank = engine.metadata.worker_id
+        connector = engine.gpu_connector
+        if capability is not None:
+            monkeypatch.setattr(
+                connector,
+                "supports_layerwise_prefill_transfer_timings",
+                capability,
+                raising=False,
+            )
+        prepare = connector.prepare_layerwise_prefill_slots
+        process = engine.token_database.process_tokens
+        ack = engine.layerwise_prefill_ack
+        transfer = connector.transfer_layerwise_prefill_row
+
+        def prepare_slots(*args: Any, **kwargs: Any) -> Any:
+            result = prepare(*args, **kwargs)
+            clock[rank] += 0.002
+            return result
+
+        def plan_tokens(*args: Any, **kwargs: Any) -> Any:
+            result = list(process(*args, **kwargs))
+            clock[rank] += 0.001
+            return result
+
+        def acknowledge(*args: Any, **kwargs: Any) -> None:
+            ack(*args, **kwargs)
+            clock[rank] += 0.003
+
+        def timed_transfer(
+            *args: Any, kv_group: int, direction: bool, timing: dict
+        ) -> None:
+            assert len(args) == 5
+            assert timing is backend._transfer_timings[int(direction)]
+            transfer(*args, kv_group=kv_group, direction=direction)
+            seconds = (0.008, 0.016, 0.032) if direction else (0.001, 0.002, 0.004)
+            for key, value in zip(
+                ("prepare_s", "submit_s", "fence_s"), seconds, strict=True
+            ):
+                timing[key] = timing.get(key, 0.0) + value
+            clock[rank] += sum(seconds)
+
+        monkeypatch.setattr(connector, "prepare_layerwise_prefill_slots", prepare_slots)
+        monkeypatch.setattr(engine.token_database, "process_tokens", plan_tokens)
+        monkeypatch.setattr(engine, "layerwise_prefill_ack", acknowledge)
+        if capability is True:
+            monkeypatch.setattr(
+                connector, "transfer_layerwise_prefill_row", timed_transfer
+            )
+        # Non-literal/truthy capabilities retain a hook with no timing keyword.
+        backend = engine.layerwise_prefill_window_backend
+        assert backend._transfer_timing_enabled is (capability is True)
+        return backend
+
     runtime.thread.rank = 0
-    root_backend = root.layerwise_prefill_window_backend
+    root_backend = instrument(root)
     runtime.thread.rank = 1
-    passive_backend = passive.layerwise_prefill_window_backend
+    passive_backend = instrument(passive)
     logged = []
     monkeypatch.setattr(
         sync_module.logger,
         "info",
-        lambda message, *args: logged.append(message % args),
+        lambda message, *args: logged.append((runtime.thread.rank, message % args)),
     )
-    for start, end in ((0, 300), (300, 530)):
-        requests = [_request(start=start, end=end)]
+    steps = ((2, 0, 300), (1, 300, 530), (1, 530, 560))
+    for step, (count, start, end) in enumerate(steps, start=1):
+        requests = [_request(i, start=start, end=end) for i in range(count)]
         runtime.parallel(
             lambda requests=requests: _step(root, root_backend, requests),
             lambda requests=requests: _step(passive, passive_backend, requests),
         )
-    assert len(logged) == 4
-    assert ["event=begin" in line for line in logged] == [True, False, True, False]
-    assert "saved=(79, 22)" in logged[-1]
-    assert "reused_rows=101 published_handles=202" in logged[-1]
-    assert "completed_ends=[('req-0', 530)]" in logged[-1]
-    for name in ("elapsed_ms", "bind_ms", "load_ms", "save_ms", "other_ms"):
-        assert name + "=" in logged[-1]
+        assert len(logged) == 2 * step
+        begin, line = [entry[1] for entry in logged[-2:]]
+        assert f"event=begin step={step} requests={count}" in begin
+        assert f"event=end step={step} requests={count} saved=(79, 22)" in line
+        assert all("parts_ms" not in entry[1] for entry in logged[::2])
+        assert (
+            f"prepared_slots={4 * count} transfer_timing={capability is True}" in line
+        )
+        assert f"reused_rows={101 if start else 0} " in line
+        assert f"published_handles={101 * count * (1 if start == 530 else 2)} " in line
+        assert f"completed_ends={[(req.request_id, end) for req in requests]}" in line
+        bind_parts = (4.0, count * 8.0, 3.0)
+        assert f"bind_parts_ms=(plan,slots,ack):{bind_parts}" in line
+        load_count = 101 if start and capability is True else 0
+        save_count = 101 * count if capability is True else 0
+        ack_ms = 101 * (1 + count) * 3.0
+        load_parts = (load_count * 1.0, load_count * 2.0, load_count * 4.0, ack_ms)
+        save_parts = (save_count * 8.0, save_count * 16.0, save_count * 32.0, ack_ms)
+        assert f"load_parts_ms=(prepare,submit,fence,ack):{load_parts}" in line
+        assert f"save_parts_ms=(prepare,submit,fence,ack):{save_parts}" in line
+        for name, expected in (
+            ("bind_ms", sum(bind_parts)),
+            ("load_ms", sum(load_parts)),
+            ("save_ms", sum(save_parts)),
+            ("other_ms", 3.0),
+            ("elapsed_ms", sum(bind_parts) + sum(load_parts) + sum(save_parts) + 3.0),
+        ):
+            actual = float(line.split(f" {name}=", 1)[1].split()[0])
+            assert actual == pytest.approx(expected, abs=0.001)
+    assert all(rank == 0 for rank, _ in logged)
 
 
 def test_failed_step_does_not_log_a_completed_extent(
@@ -1286,19 +1598,44 @@ def test_bind_rejects_changed_continuation(runtime: Any, change: str) -> None:
     backend.abort_request("req-0")
 
 
-def test_new_allocation_restores_into_rebound_blocks(runtime: Any) -> None:
+@pytest.mark.parametrize("generation", [1, 2])
+def test_rebind_prepares_new_plans_and_restores_into_current_blocks(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, generation: int
+) -> None:
     engine = runtime.engine()
     backend = engine.layerwise_prefill_window_backend
+    snapshots = []
+    finish = backend.finish_step
+
+    def retain_plans() -> None:
+        snapshots.append(dict(backend._slots))
+        finish()
+        assert not backend._slots
+
+    monkeypatch.setattr(backend, "finish_step", retain_plans)
     _step(engine, backend, [_request()])
-    req = _request(start=300, end=530, generation=2)
+    req = _request(start=300, end=530, generation=generation)
     req = replace(
         req,
         block_ids_by_bank=tuple(
-            tuple(tuple(block + 24 for block in blocks) for blocks in groups)
+            tuple(
+                tuple(block + (24 if generation == 2 else 0) for block in blocks)
+                for blocks in groups
+            )
             for groups in req.block_ids_by_bank
         ),
     )
     _step(engine, backend, [req])
+    assert len(engine.gpu_connector.prepared) == 8
+    for identity, old in snapshots[0].items():
+        current = snapshots[1][identity]
+        assert current is not old
+        assert old.snapshot.numel() == 300 and current.snapshot.numel() == 530
+        assert torch.equal(
+            current.snapshot, _slots(req, identity[1], identity[2], req.compute_end)
+        )
+    assert all(engine.gpu_connector.plan_uses[i, False] == 0 for i in range(4))
+    assert sum(engine.gpu_connector.plan_uses[i, False] for i in range(4, 8)) == 101
     backend.abort_request("req-0")
     with pytest.raises(ValueError, match="Released"):
         backend.bind_step([req], _registry(engine))

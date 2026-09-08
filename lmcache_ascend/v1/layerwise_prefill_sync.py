@@ -78,7 +78,7 @@ class LayerwisePrefillSyncBackend:
         self._released: dict[str, int] = {}
         self._prefixes: dict[tuple[str, int, int, int], _RowPrefix] = {}
         self._caches: dict[str, tuple[torch.Tensor, ...]] = {}
-        self._slots: dict[tuple[str, int, int], torch.Tensor] = {}
+        self._slots: dict[tuple[str, int, int], Any] = {}
         self._plans: dict[tuple[str, int, int], list[tuple]] = {}
         self._saved = [0, 0]
         self._ready: set[tuple[int, int]] = set()
@@ -93,6 +93,18 @@ class LayerwisePrefillSyncBackend:
         self._save_seconds = 0.0
         self._reused_rows = 0
         self._published_handles = 0
+        self._bind_parts = (0.0, 0.0, 0.0)
+        self._ack_seconds: dict[str, float] = {}
+        self._transfer_timings: tuple[dict[str, float], dict[str, float]] = ({}, {})
+        self._transfer_timing_enabled = (
+            getattr(
+                engine.gpu_connector,
+                "supports_layerwise_prefill_transfer_timings",
+                False,
+            )
+            is True
+        )
+        self._prepared_slot_count = 0
 
     @property
     def topology_signature(self) -> str:
@@ -124,6 +136,8 @@ class LayerwisePrefillSyncBackend:
         slots = {}
         plans = {}
         commit_starts = {}
+        plan_seconds = slot_seconds = 0.0
+        prepared_count = 0
         started = perf_counter()
         try:
             if validation_error is not None:
@@ -229,6 +243,7 @@ class LayerwisePrefillSyncBackend:
                         raise ValueError(
                             "Changed bank allocation requires a new generation"
                         )
+                stage_started = perf_counter()
                 for group in (0, 1):
                     for end in {req.restore_end, req.compute_end}:
                         plan = (
@@ -255,6 +270,15 @@ class LayerwisePrefillSyncBackend:
                             (start, stop, key.with_new_worker_id(0))
                             for start, stop, key in plan
                         ]
+                plan_seconds += perf_counter() - stage_started
+                stage_started = perf_counter()
+                # Bank IDs originate on the host. Prepare their common position
+                # arithmetic once, rather than reading device slots back per row.
+                positions = torch.arange(
+                    req.compute_end, dtype=torch.long, device="cpu"
+                )
+                block_indices = positions // req.block_size
+                block_offsets = positions % req.block_size
                 for bank, groups in enumerate(req.block_ids_by_bank):
                     for group, blocks in enumerate(groups):
                         used = occupied.setdefault((bank, group), set())
@@ -269,23 +293,37 @@ class LayerwisePrefillSyncBackend:
                             raise ValueError(
                                 "Layerwise-prefill blocks exceed the KV plane"
                             )
-                        positions = torch.arange(
-                            max(req.compute_end, req.restore_end), device=plane.device
-                        )
                         block_tensor = torch.tensor(
-                            blocks, dtype=torch.long, device=plane.device
+                            blocks, dtype=torch.long, device="cpu"
                         )
                         slots[req.request_id, bank, group] = (
-                            block_tensor[positions // req.block_size] * req.block_size
-                            + positions % req.block_size
+                            block_tensor[block_indices] * req.block_size + block_offsets
                         )
+                slot_seconds += perf_counter() - stage_started
             self._engine.initialize_layerwise_prefill_layout(caches)
+            prepare = getattr(
+                self._engine.gpu_connector, "prepare_layerwise_prefill_slots", None
+            )
+            if callable(prepare):
+                stage_started = perf_counter()
+                for identity, mapping in slots.items():
+                    group = identity[2]
+                    plane = caches[self._view.rows_by_group[group][0][0]][0]
+                    slots[identity] = prepare(
+                        mapping,
+                        kv_group=group,
+                        capacity=int(plane.shape[0] * plane.shape[1]),
+                    )
+                    prepared_count += 1
+                slot_seconds += perf_counter() - stage_started
         except Exception as exc:
             error = exc
+        ack_started = perf_counter()
         self._engine.layerwise_prefill_ack(
             ("bind", self._step + 1, frozen, plans, self._page_first, commit_starts),
             error,
         )
+        self._bind_parts = (plan_seconds, slot_seconds, perf_counter() - ack_started)
         for req in frozen:
             prior = self._history.get(req.request_id)
             if (
@@ -309,6 +347,9 @@ class LayerwisePrefillSyncBackend:
         self._bind_seconds = perf_counter() - started
         self._load_seconds = self._save_seconds = 0.0
         self._reused_rows = self._published_handles = 0
+        self._prepared_slot_count = prepared_count
+        self._ack_seconds = {}
+        self._transfer_timings = ({}, {})
 
     def wait_for_load(
         self, metadata: Any, *, validation_error: Exception | None = None
@@ -628,7 +669,11 @@ class LayerwisePrefillSyncBackend:
                 "[PREFILL_SYNC_STEP] event=end step=%d requests=%d saved=%s "
                 "elapsed_ms=%.3f bind_ms=%.3f load_ms=%.3f save_ms=%.3f "
                 "other_ms=%.3f reused_rows=%d published_handles=%d "
-                "completed_ends=%s page_persist_ms=%.3f pages=%d",
+                "completed_ends=%s page_persist_ms=%.3f pages=%d "
+                "prepared_slots=%d transfer_timing=%s "
+                "bind_parts_ms=(plan,slots,ack):%s "
+                "load_parts_ms=(prepare,submit,fence,ack):%s "
+                "save_parts_ms=(prepare,submit,fence,ack):%s",
                 self._step,
                 len(self._requests),
                 tuple(self._saved),
@@ -649,6 +694,19 @@ class LayerwisePrefillSyncBackend:
                 [(req.request_id, req.compute_end) for req in self._requests],
                 persist_seconds * 1000 if self._page_first else 0.0,
                 pages,
+                self._prepared_slot_count,
+                self._transfer_timing_enabled,
+                tuple(round(value * 1000, 3) for value in self._bind_parts),
+                *(
+                    tuple(
+                        round(timing.get(key, 0.0) * 1000, 3)
+                        for key in ("prepare_s", "submit_s", "fence_s")
+                    )
+                    + (round(self._ack_seconds.get(phase, 0.0) * 1000, 3),)
+                    for phase, timing in zip(
+                        ("load", "save"), self._transfer_timings, strict=True
+                    )
+                ),
             )
         self._bound = False
         self._requests = ()
@@ -804,6 +862,8 @@ class LayerwisePrefillSyncBackend:
         return group, ordinal, bank, key[0]
 
     def _ack(self, identity: tuple, error: Exception | None = None) -> None:
+        started = perf_counter()
+        phase = identity[1] if identity[0] == "validate" else identity[0]
         try:
             self._engine.layerwise_prefill_ack((self._step, identity), error)
         except Exception as exc:
@@ -819,6 +879,10 @@ class LayerwisePrefillSyncBackend:
                     self._release(objects)
             self._pending_rows.clear()
             raise
+        finally:
+            self._ack_seconds[phase] = (
+                self._ack_seconds.get(phase, 0.0) + perf_counter() - started
+            )
 
     def _transfer(
         self,
@@ -841,6 +905,11 @@ class LayerwisePrefillSyncBackend:
                 self._slots[req.request_id, bank, group],
                 kv_group=group,
                 direction=direction,
+                **(
+                    {"timing": self._transfer_timings[int(direction)]}
+                    if self._transfer_timing_enabled
+                    else {}
+                ),
             )
         except Exception:
             # A retained Tensor alone does not protect an allocator's shm offset

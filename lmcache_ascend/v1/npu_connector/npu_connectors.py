@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 import hashlib
 import json
 import os
+from time import perf_counter
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
 # Third Party
@@ -1467,6 +1469,20 @@ class _GroupLayout:
         self.topology_signature: Optional[str] = None
 
 
+@dataclass(frozen=True, eq=False)
+class _PreparedLayerwisePrefillSlots:
+    """Caller-owned, bind-scoped snapshot; construct via the connector only."""
+
+    _owner: Any
+    _layout: _GroupLayout
+    _kv_group: int
+    _capacity: int
+    _device: torch.device
+    _slots: torch.Tensor
+    _version: int
+    _length: int
+
+
 class _SparseDestinationPlan:
     """Process-owned native states for one paged-KV destination group."""
 
@@ -1495,6 +1511,7 @@ class _SparseLoadJoin:
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     supports_layer_page_source = True
+    supports_layerwise_prefill_transfer_timings = True
 
     def __init__(
         self,
@@ -1569,17 +1586,88 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ] = {}
         self._layerwise_prefill_row_failed_owners: Optional[list[Any]] = None
 
+    def prepare_layerwise_prefill_slots(
+        self,
+        slot_mapping: torch.Tensor,
+        *,
+        kv_group: int,
+        capacity: int,
+    ) -> _PreparedLayerwisePrefillSlots:
+        """Snapshot and validate an injective bank mapping once per caller bind.
+
+        The full group must already be initialized. ``capacity`` is the actual
+        plane's ``shape[0] * shape[1]`` and is checked again at row transfer.
+        CPU mappings avoid NPU readback; NPU inputs are read back once here.
+        The returned internal plan owns its storage independently of the input.
+        Keep it within the bind that supplied the bank mapping, then discard it;
+        the connector does not cache plans or retain successful row owners.
+        """
+        if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
+            raise RuntimeError("A previous prefill row completion fence failed")
+        if type(kv_group) is not int or kv_group < 0:
+            raise ValueError("kv_group must be a non-negative integer")
+        layout = self._group_layouts.get(kv_group)
+        if (
+            layout is None
+            or layout.num_layers <= 0
+            or layout.layer_indices != tuple(range(layout.num_layers))
+        ):
+            raise ValueError(
+                f"Prefill slots require a registered full group layout: {kv_group}"
+            )
+        device = layout.kv_device
+        if device is None or device.type != "npu":
+            raise ValueError("Prefill slots require a registered NPU layout")
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("Prefill slot capacity must be a positive integer")
+        if (
+            not isinstance(slot_mapping, torch.Tensor)
+            or slot_mapping.ndim != 1
+            or slot_mapping.layout != torch.strided
+            or slot_mapping.dtype not in (torch.int32, torch.int64)
+            or (slot_mapping.device.type != "cpu" and slot_mapping.device != device)
+        ):
+            raise ValueError("slot_mapping must be 1D int32/int64 on CPU or the KV NPU")
+
+        # vLLM calls under inference_mode: clone outside it so _version remains
+        # available, and validate the isolated snapshot rather than caller data.
+        with torch.inference_mode(False), torch.npu.device(device):
+            slots_cpu = (
+                slot_mapping.detach()
+                .to(device="cpu", dtype=torch.int64)
+                .clone(memory_format=torch.contiguous_format)
+            )
+            slot_values = slots_cpu.tolist()
+            if any(slot < 0 or slot >= capacity for slot in slot_values):
+                raise ValueError("Prefill row slot is out of KV capacity")
+            if len(set(slot_values)) != len(slot_values):
+                raise ValueError(
+                    "Prefill prepared slot_mapping contains duplicate slots"
+                )
+            slots_npu = slots_cpu.to(device=device, dtype=torch.int64)
+        return _PreparedLayerwisePrefillSlots(
+            self,
+            layout,
+            kv_group,
+            capacity,
+            device,
+            slots_npu,
+            slots_npu._version,
+            len(slot_values),
+        )
+
     def transfer_layerwise_prefill_row(
         self,
         kv_layer: Sequence[torch.Tensor],
         cpu_chunks: Sequence[torch.Tensor],
         starts: Sequence[int],
         ends: Sequence[int],
-        slot_mapping: torch.Tensor,
+        slot_mapping: Union[torch.Tensor, _PreparedLayerwisePrefillSlots],
         *,
         kv_group: int,
         direction: bool,
         slot_mapping_base: int = 0,
+        timing: Optional[dict[str, float]] = None,
     ) -> None:
         """Synchronously transfer one actual MLA/DSA row, without KV staging.
 
@@ -1590,7 +1678,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         exactly ``end - start`` tokens, packed as stacked planes (including
         short tails). Ranges index ``slot_mapping`` relative to its absolute
         ``slot_mapping_base``; gaps are allowed and H2D slots must be unique.
+        A plan from ``prepare_layerwise_prefill_slots`` reuses validated NPU
+        slots without packing or readback when the supplied ranges are consecutive.
         Empty chunks/starts/ends are an explicit no-op.
+
+        Optional ``timing`` accumulates host seconds in ``prepare_s`` (validation,
+        packing, registration and metadata), ``submit_s`` (native wrapper) and
+        ``fence_s`` (completion fence), without extra synchronization or logging.
 
         Owners and metadata survive the completion fence, even if launch fails.
         A failed fence retains them on the connector and disables this hook:
@@ -1598,6 +1692,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """
         if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
             raise RuntimeError("A previous prefill row completion fence failed")
+        prepare_start = perf_counter() if timing is not None else 0.0
         if type(kv_group) is not int or kv_group < 0:
             raise ValueError("kv_group must be a non-negative integer")
         if type(direction) is not bool:
@@ -1668,17 +1763,51 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "geometry, be contiguous, and share the same NPU device"
                 )
         capacity = int(planes[0].shape[0] * planes[0].shape[1])
-        if (
-            not isinstance(slot_mapping, torch.Tensor)
-            or slot_mapping.ndim != 1
-            or slot_mapping.layout != torch.strided
-            or slot_mapping.dtype not in (torch.int32, torch.int64)
-            or (slot_mapping.device.type != "cpu" and slot_mapping.device != device)
-        ):
-            raise ValueError("slot_mapping must be 1D int32/int64 on CPU or the KV NPU")
+        prepared = (
+            slot_mapping
+            if isinstance(slot_mapping, _PreparedLayerwisePrefillSlots)
+            else None
+        )
+        if prepared is not None:
+            if prepared._owner is not self:
+                raise ValueError("Prefill prepared slots belong to another connector")
+            if prepared._kv_group != kv_group or prepared._layout is not layout:
+                raise ValueError(
+                    "Prefill prepared slots belong to another group/layout"
+                )
+            if prepared._capacity != capacity:
+                raise ValueError(
+                    "Prefill prepared slot capacity does not match KV planes"
+                )
+            mapping = prepared._slots
+            if prepared._device != device or mapping.device != device:
+                raise ValueError("Prefill prepared slots belong to another NPU device")
+            if (
+                mapping._version != prepared._version
+                or mapping.dtype != torch.int64
+                or mapping.ndim != 1
+                or mapping.numel() != prepared._length
+                or not mapping.is_contiguous()
+            ):
+                raise ValueError("Prefill prepared slot snapshot was mutated")
+            mapping_length = prepared._length
+        else:
+            if (
+                not isinstance(slot_mapping, torch.Tensor)
+                or slot_mapping.ndim != 1
+                or slot_mapping.layout != torch.strided
+                or slot_mapping.dtype not in (torch.int32, torch.int64)
+                or (slot_mapping.device.type != "cpu" and slot_mapping.device != device)
+            ):
+                raise ValueError(
+                    "slot_mapping must be 1D int32/int64 on CPU or the KV NPU"
+                )
+            mapping = slot_mapping
+            mapping_length = len(mapping)
 
         offsets, sizes, ranges = [], [], []
         total_tokens = 0
+        consecutive = True
         for chunk, start, end in zip(chunks, starts, ends, strict=True):
             if type(start) is not int or type(end) is not int:
                 raise ValueError("Prefill row ranges must contain integers")
@@ -1686,7 +1815,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if (
                 local_start < 0
                 or local_end <= local_start
-                or local_end > len(slot_mapping)
+                or local_end > mapping_length
             ):
                 raise ValueError(
                     "Prefill row requires positive ranges inside slot_mapping"
@@ -1706,6 +1835,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             offsets.append(total_tokens)
             sizes.append(size)
+            if ranges and ranges[-1][1] != local_start:
+                consecutive = False
             ranges.append((local_start, local_end))
             total_tokens += size
         if total_tokens > torch.iinfo(torch.int32).max:
@@ -1716,21 +1847,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             raise ValueError("Prefill row transfer stream must be on the KV NPU device")
         # Native commands retain raw pointers, not these Python tensor owners.
         owners: list[Any] = [planes, chunks, slot_mapping]
+        submit_start = None
         with torch.npu.device(device):
             compute_stream = torch.npu.current_stream(device)
             try:
                 with torch.npu.stream(transfer_stream):
                     transfer_stream.wait_stream(compute_stream)
-                    slots = torch.cat([slot_mapping[s:e] for s, e in ranges])
+                    slots = (
+                        mapping[ranges[0][0] : ranges[-1][1]]
+                        if consecutive
+                        else torch.cat([mapping[s:e] for s, e in ranges])
+                    )
                     owners.append(slots)
-                    slot_values = slots.detach().to(device="cpu").tolist()
-                    if any(slot < 0 or slot >= capacity for slot in slot_values):
-                        raise ValueError("Prefill row slot is out of KV capacity")
-                    if not direction and len(set(slot_values)) != total_tokens:
-                        raise ValueError(
-                            "Prefill row H2D slot_mapping contains duplicate slots"
-                        )
-                    slots_npu = slots.to(device=device, dtype=torch.int64)
+                    if prepared is not None and consecutive:
+                        slots_npu = slots
+                    else:
+                        slot_values = slots.detach().to(device="cpu").tolist()
+                        if any(slot < 0 or slot >= capacity for slot in slot_values):
+                            raise ValueError("Prefill row slot is out of KV capacity")
+                        if not direction and len(set(slot_values)) != total_tokens:
+                            raise ValueError(
+                                "Prefill row H2D slot_mapping contains duplicate slots"
+                            )
+                        slots_npu = slots.to(
+                            device=device, dtype=torch.int64
+                        ).contiguous()
                     owners.append(slots_npu)
                     pointers = [
                         self._resolve_registered_cpu_source_device_ptr(
@@ -1755,6 +1896,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     owners.append(offsets_npu)
                     sizes_npu = torch.tensor(sizes, dtype=torch.int32, device=device)
                     owners.append(sizes_npu)
+                    if timing is not None:
+                        submit_start = perf_counter()
                     dense_mla_dsa_batched_direct_kv_transfer(
                         chunks,
                         planes,
@@ -1774,11 +1917,25 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         fixed_chunk_size=0,
                     )
             finally:
+                if timing is not None:
+                    fence_start = perf_counter()
+                    prepare_end = fence_start if submit_start is None else submit_start
+                    timing["prepare_s"] = (
+                        timing.get("prepare_s", 0.0) + prepare_end - prepare_start
+                    )
+                    timing["submit_s"] = (
+                        timing.get("submit_s", 0.0) + fence_start - prepare_end
+                    )
                 try:
                     transfer_stream.synchronize()
                 except BaseException:
                     self._layerwise_prefill_row_failed_owners = owners
                     raise
+                finally:
+                    if timing is not None:
+                        timing["fence_s"] = (
+                            timing.get("fence_s", 0.0) + perf_counter() - fence_start
+                        )
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE
