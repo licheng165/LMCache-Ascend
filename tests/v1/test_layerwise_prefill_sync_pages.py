@@ -34,6 +34,9 @@ import torch
 import vllm.distributed.parallel_state
 
 # First Party
+from lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1 import (
+    LMCacheAscendConnectorV1Dynamic,
+)
 from lmcache_ascend.v1.layerwise_prefill_sync import LayerwisePrefillFenceError
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
@@ -492,9 +495,113 @@ def test_pending_group_abort_releases_unpublished_rows(page_runtime: Any) -> Non
     )
 
 
+@pytest.mark.parametrize("size", [1, 2])
+def test_page_capabilities_precede_storage_and_kv_registration(
+    page_runtime: Any, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    root = page_runtime.engine(size=size)
+    engines = [root]
+    if size == 2:
+        engines.append(page_runtime.engine(1, root, size=size))
+    adapters = []
+    for rank, engine in enumerate(engines):
+        page_runtime.thread.rank = rank
+        engine.num_layers = engine.metadata.kv_shape[0]
+        manager, name = engine.storage_manager, engine.shared_cpu_cache_name
+        engine.storage_manager, engine.shared_cpu_cache_name = None, None
+        try:
+            # Production constructs the adapter/backend before register_kv_caches
+            # calls manager.post_init(). No transport/slab is available yet.
+            adapter = _make_adapter(
+                SimpleNamespace(
+                    engine=lambda engine=engine: engine, serving=page_runtime.serving
+                ),
+                monkeypatch,
+            )
+            connector = object.__new__(LMCacheAscendConnectorV1Dynamic)
+            connector._lmcache_engine = adapter
+            assert connector.supports_layerwise_prefill_p_node
+            assert connector.supports_layerwise_prefill_eager_callbacks
+            assert connector.supports_dsa_index_lmcache
+            assert not connector.supports_layerwise_prefill_transfer_window
+            assert engine.storage_manager is None
+            assert not engine.gpu_connector.layouts
+
+            def post_init(
+                engine: Any = engine, manager: Any = manager, name: str = name
+            ) -> None:
+                assert engine.storage_manager is None
+                assert [
+                    group.num_layers
+                    for group in engine.metadata.kv_layer_groups_manager.kv_layer_groups
+                ] == [79, 22]
+                engine.storage_manager, engine.shared_cpu_cache_name = manager, name
+
+            adapter._manager.post_init = Mock(side_effect=post_init)
+            adapter.dsa_kv_topology = adapter._dsa_kv_topology_cache.descriptor
+            adapter.kv_caches = {}
+            connector.register_kv_caches(
+                {name: tuple(planes) for name, planes in _registry(engine).items()}
+            )
+            adapter._manager.post_init.assert_called_once_with()
+            adapters.append(adapter)
+        finally:
+            engine.storage_manager, engine.shared_cpu_cache_name = manager, name
+
+    connection = root.storage_manager.storage_backends["RemoteBackend"].connection
+    validate = Mock(wraps=connection.validate_page_first_layout)
+    monkeypatch.setattr(connection, "validate_page_first_layout", validate)
+    req = _request()
+
+    def run(adapter: Any) -> None:
+        _save_rows(adapter, [req], _start(adapter, [req], final=True))
+        adapter.wait_for_save()
+        assert adapter.layerwise_prefill_request_persist_done(req.request_id)
+
+    page_runtime.parallel(
+        *(lambda adapter=adapter: run(adapter) for adapter in adapters)
+    )
+    assert [call.args[:2] for call in validate.call_args_list] == [(0, 79), (1, 22)]
+    _assert_remote(root, req, page_runtime.store)
+
+
 @pytest.mark.parametrize(
-    "setting", ["url", "serde", "metadata", "merged", "direct", "capability"]
+    "failure", ["storage", "remote", "connection", "capability", "layout_hook"]
 )
+def test_page_transport_readiness_fails_on_all_ranks_before_transfer(
+    page_runtime: Any, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    adapters = _make_tp_adapters(page_runtime, monkeypatch)
+    root = adapters[0].lmcache_engine
+    manager = root.storage_manager
+    remote = manager.storage_backends["RemoteBackend"]
+    if failure == "storage":
+        root.storage_manager = None
+    elif failure == "remote":
+        monkeypatch.delitem(manager.storage_backends, "RemoteBackend")
+    elif failure == "connection":
+        monkeypatch.setattr(remote, "connection", None)
+    elif failure == "capability":
+        monkeypatch.setattr(page_runtime.store, "batch_get_into_multi_buffers", None)
+    else:
+        monkeypatch.setattr(remote.connection, "validate_page_first_layout", None)
+
+    def bind(adapter: Any) -> None:
+        with pytest.raises(ValueError, match="requires.*(storage|RemoteBackend)"):
+            _start(adapter, [_request()])
+        assert not adapter.layerwise_prefill_request_persist_done("req-0")
+        assert not adapter.lmcache_engine.gpu_connector.calls
+
+    try:
+        page_runtime.parallel(
+            *(lambda adapter=adapter: bind(adapter) for adapter in adapters)
+        )
+        assert not page_runtime.store.gets and not page_runtime.store.puts
+    finally:
+        root.storage_manager = manager
+
+
+@pytest.mark.parametrize("setting", ["url", "serde", "metadata", "merged", "direct"])
 def test_page_factory_rejects_invalid_transport(
     page_runtime: Any, setting: str
 ) -> None:
@@ -509,8 +616,6 @@ def test_page_factory_rejects_invalid_transport(
         engine.config.extra_config["mooncake_layer_merged_page_objects"] = True
     elif setting == "direct":
         engine.config.extra_config["mooncake_direct_npu_prefill_store"] = True
-    else:
-        page_runtime.store.batch_get_into_multi_buffers = None
     with pytest.raises(ValueError, match="requires|support"):
         _ = engine.layerwise_prefill_window_backend
 

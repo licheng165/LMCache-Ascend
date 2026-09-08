@@ -467,7 +467,8 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Expose sync-only production P, or an explicitly opted-in window.
 
         With P enabled, unsupported configurations raise before capabilities
-        can be frozen; there is no legacy or transfer-window fallback.
+        can be frozen; there is no legacy or transfer-window fallback. Live
+        storage and row layouts are validated at bind, after KV registration.
         """
         p_enabled = _layerwise_prefill_p_node_enabled()
         backend = getattr(self, "_layerwise_prefill_window_backend", None)
@@ -527,7 +528,9 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         Only eager, single-host TP, BF16 two-group 79/22 MLA with strict shared
         CPU storage and exact 256-token chunks is supported. Raises ValueError
-        if any prerequisite (including the synchronous row hook) is absent.
+        if a construction-time prerequisite (including the row hook) is absent.
+        StorageManager is created later by register_kv_caches -> post_init;
+        initialize_layerwise_prefill_layout checks live transport before I/O.
         """
         config, metadata = self.config, self.metadata
         if not _layerwise_prefill_p_node_enabled():
@@ -576,14 +579,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                     "Layerwise-prefill page-first requires Mooncake, "
                     "remote_serde=naive and save_chunk_meta=false"
                 )
-            if metadata.is_first_rank():
-                remote = self.storage_manager.storage_backends.get("RemoteBackend")
-                connection = getattr(remote, "connection", None)
-                capability = getattr(connection, "supports_page_first", None)
-                if not callable(capability) or capability() is not True:
-                    raise ValueError(
-                        "Layerwise-prefill requires a live page-first RemoteBackend"
-                    )
         if not callable(
             getattr(self.gpu_connector, "transfer_layerwise_prefill_row", None)
         ):
@@ -646,10 +641,20 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
     def initialize_layerwise_prefill_layout(self, kv_caches: dict[str, Any]) -> None:
-        """Initialize both complete registry-ordered layouts, never a singleton row."""
+        """Validate registered layouts and live storage before any row transfer.
+
+        Called inside bind's all-TP error agreement, after post_init creates the
+        root storage manager and passive shared mappings. No readiness check may
+        require a RemoteBackend on passive ranks.
+        """
         if not self.shared_cpu_cache_name:
             raise ValueError("Layerwise-prefill requires shared CPU startup preflight")
         if self.metadata.is_first_rank():
+            if self.storage_manager is None:
+                raise ValueError(
+                    "Layerwise-prefill requires initialized storage; "
+                    "register KV caches before binding a step"
+                )
             if self._shared_rank0_object_context(0) is None:
                 raise ValueError("Layerwise-prefill requires the rank0 shared CPU slab")
         elif self.shared_cpu_cache_passive_allocator is None:
@@ -664,10 +669,19 @@ class AscendLMCacheEngine(LMCacheEngine):
         if self.metadata.is_first_rank() and mooncake_page_layout_enabled(self.config):
             remote = self.storage_manager.storage_backends.get("RemoteBackend")
             connection = getattr(remote, "connection", None)
-            if connection is None:
-                raise ValueError("Page-first layout requires a connected RemoteBackend")
+            capability = getattr(connection, "supports_page_first", None)
+            validate = getattr(connection, "validate_page_first_layout", None)
+            if (
+                not callable(capability)
+                or capability() is not True
+                or not callable(validate)
+            ):
+                raise ValueError(
+                    "Layerwise-prefill requires a live page-first RemoteBackend "
+                    "with layout validation"
+                )
             for group, count in enumerate(self._dsa_kv_topology_view.layer_counts):
-                connection.validate_page_first_layout(
+                validate(
                     group, count, *self.layerwise_prefill_row_metadata(group, 256)
                 )
 
