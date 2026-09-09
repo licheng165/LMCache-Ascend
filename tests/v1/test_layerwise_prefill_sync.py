@@ -290,6 +290,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
     world = SimpleNamespace(size=1)
     engines = []
     real_gather = torch.distributed.all_gather_object
+    real_tensor_gather = torch.distributed.all_gather
     real_initialized = torch.distributed.is_initialized
 
     def tp() -> Any:
@@ -300,15 +301,24 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
         )
 
     def gather(out: list, status: Any, group: Any) -> None:
-        assert group is barrier
-        statuses[thread.rank] = deepcopy(status)
+        tensor = isinstance(status, torch.Tensor)
+        if group is not barrier:
+            return (real_tensor_gather if tensor else real_gather)(
+                out, status, group=group
+            )
+        statuses[thread.rank] = status.clone() if tensor else deepcopy(status)
         barrier.wait()
-        out[:] = statuses
+        if tensor:
+            for target, peer in zip(out, statuses, strict=True):
+                target.copy_(peer)
+        else:
+            out[:] = statuses
         barrier.wait()
 
     monkeypatch.setattr(vllm.distributed.parallel_state, "get_tp_group", tp)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
 
     def engine(
         rank: int = 0,

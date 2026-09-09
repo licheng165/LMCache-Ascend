@@ -4,12 +4,15 @@
 # ruff: noqa: F811
 
 # Standard
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 from threading import Barrier, Event
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
+import ast
 import pickle
 
 # Third Party
@@ -27,6 +30,8 @@ from lmcache_ascend.v1.layerwise_prefill_sync import LayerwisePrefillFenceError
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
 )
+import lmcache_ascend.v1.layerwise_prefill_async as async_module
+import lmcache_ascend.v1.layerwise_prefill_sync as sync_module
 
 # Local
 from tests.v1.test_layerwise_prefill_row_transfer import (
@@ -219,6 +224,259 @@ def _execute(
         backend.finish_step()
         assert future.done() and future.result() is None
     return future
+
+
+@pytest.mark.parametrize("error_type", [None, ValueError, KeyboardInterrupt])
+def test_timed_call_preserves_result_error_and_exact_host_time(
+    monkeypatch: Any, error_type: type | None
+) -> None:
+    backend = object.__new__(LayerwisePrefillAsyncBackend)
+    backend._host_timings = {}
+    clock = Mock(side_effect=[10.0, 10.125, 100.0, 100.5, 200.0, 200.25])
+    monkeypatch.setattr(async_module, "perf_counter", clock)
+    argument, result = object(), object()
+    function = Mock(return_value=result)
+    assert backend._timed_call("prepare_load", function, argument, flag=True) is result
+    function.assert_called_once_with(argument, flag=True)
+
+    error = error_type("timed sentinel") if error_type is not None else None
+    function = Mock(return_value=result, side_effect=error)
+    if error is None:
+        assert backend._timed_call("prepare_load", function, argument) is result
+    else:
+        with pytest.raises(error_type) as caught:
+            backend._timed_call("prepare_load", function, argument)
+        assert caught.value is error
+    function.assert_called_once_with(argument)
+    assert backend._timed_call("submit_load", lambda: result) is result
+    assert backend._host_timings == {
+        "prepare_load": (2, 0.625, 0.5),
+        "submit_load": (1, 0.25, 0.25),
+    }
+    assert clock.call_count == 6
+
+
+def test_async_host_timing_scopes_include_save_preparation_and_publication_ack(
+    page_runtime: Any, monkeypatch: Any
+) -> None:
+    engine = page_runtime.engine()
+    backend = _backend(engine)
+    connector = engine.gpu_connector
+    clock = [0.0]
+    monkeypatch.setattr(async_module, "perf_counter", lambda: clock[0])
+
+    def delay(owner: Any, name: str, seconds: float) -> None:
+        function = getattr(owner, name)
+
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return function(*args, **kwargs)
+            finally:
+                clock[0] += seconds
+
+        monkeypatch.setattr(owner, name, timed)
+
+    # Only model-thread operations advance this clock, never remote workers.
+    for owner, name, seconds in (
+        (backend, "_plan", 0.002),
+        (engine, "layerwise_prefill_row_metadata", 0.004),
+        (engine.storage_manager, "allocate", 0.008),
+        (engine, "resolve_layerwise_prefill_row", 0.016),
+        (engine, "layerwise_prefill_ack", 0.032),
+        (connector, "prepare_layerwise_prefill_row", 0.001),
+        (connector, "submit_layerwise_prefill_row", 0.002),
+        (connector, "wait_layerwise_prefill_row", 0.004),
+        (connector, "complete_layerwise_prefill_row", 0.008),
+        (connector, "drain_layerwise_prefill_transfers", 0.016),
+        (connector, "synchronize_dense_load_stream", 0.032),
+        (connector, "synchronize_shared_cpu_store_publication", 0.064),
+        (RequiredPutQueue, "submit", 0.128),
+        (RequiredPutQueue, "close", 0.256),
+    ):
+        delay(owner, name, seconds)
+
+    _execute(engine, backend, [_request()])
+    assert backend.window_stats()["async_host"] == {
+        # H2D excludes source resolution, planning and preparation ACKs.
+        "prepare_load": (101, 101.0, 1.0),
+        # One scope per row: plan + two metadata/allocations + connector prepare.
+        "prepare_save": (101, 2727.0, 27.0),
+        "submit_load": (101, 202.0, 2.0),
+        "submit_save": (101, 202.0, 2.0),
+        "wait_load": (101, 404.0, 4.0),
+        "complete_load": (101, 808.0, 8.0),
+        "complete_save": (101, 808.0, 8.0),
+        # Publication includes resolve + save ACK, but not source_done ACK.
+        "publish": (101, 4848.0, 48.0),
+        "drain": (1, 112.0, 112.0),
+        "remote_submit": (2, 256.0, 128.0),
+        "remote_drain": (1, 256.0, 256.0),
+    }
+
+
+@pytest.mark.parametrize("request_count", [1, 2])
+def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
+    page_runtime: Any, monkeypatch: Any, request_count: int
+) -> None:
+    engines, backends = _tp_backends(page_runtime)
+    resets = []
+    stream_syncs = []
+    for engine, backend in zip(engines, backends, strict=True):
+        reset = Mock(wraps=engine.reset_layerwise_prefill_ack_stats)
+        monkeypatch.setattr(engine, "reset_layerwise_prefill_ack_stats", reset)
+        resets.append(reset)
+        acknowledge = engine.layerwise_prefill_ack
+
+        def ack(
+            identity: Any,
+            error: Any = None,
+            *,
+            engine: Any = engine,
+            backend: Any = backend,
+            acknowledge: Any = acknowledge,
+        ) -> None:
+            if isinstance(identity[1], tuple) and identity[1][0] == "window_bind":
+                assert backend._host_timings == {}
+                assert engine.layerwise_prefill_ack_stats()["count"] == 0
+            acknowledge(identity, error)
+
+        monkeypatch.setattr(engine, "layerwise_prefill_ack", ack)
+        for name in (
+            "synchronize_dense_load_stream",
+            "synchronize_shared_cpu_store_publication",
+        ):
+            sync = Mock(wraps=getattr(engine.gpu_connector, name))
+            monkeypatch.setattr(engine.gpu_connector, name, sync)
+            stream_syncs.append(sync)
+
+    for device in (torch.npu, torch.cuda):
+        for name in ("Event", "synchronize"):
+            monkeypatch.setattr(
+                device, name, Mock(side_effect=AssertionError("diagnostic device work"))
+            )
+    tensor_gather = Mock(wraps=torch.distributed.all_gather)
+    object_gather = Mock(wraps=torch.distributed.all_gather_object)
+    monkeypatch.setattr(torch.distributed, "all_gather", tensor_gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", object_gather)
+    logged = []
+    logger = Mock()
+    logger.info.side_effect = lambda message, *args: logged.append(
+        (page_runtime.thread.rank, message % args)
+    )
+    monkeypatch.setattr(sync_module, "logger", logger)
+    snapshots, expected_snapshots = [], []
+    slow_calls = 0
+    ack_counts = {
+        "window_bind": 1,
+        "bind": 1,
+        "validate": 101,
+        "prepare_load": 101 * request_count,
+        "load_prepared": 101 * request_count,
+        "prepare_save": 101,
+        "load_ready": 101,
+        "source_done": 101,
+        "save": 101 * request_count,
+        "device_finish": 1,
+        "finish": 1,
+        "commit": 1,
+    }
+    ack_calls = 101 * (4 + 3 * request_count) + 5
+    assert sum(ack_counts.values()) == ack_calls
+    assert request_count != 1 or ack_calls == 712
+
+    for step, (start, end) in enumerate(((0, 300), (300, 530)), start=1):
+        requests = [
+            _request(i, start=start, end=end, generation=step)
+            for i in range(request_count)
+        ]
+        page_runtime.parallel(
+            *[
+                lambda rank=rank, requests=requests: _execute(
+                    engines[rank], backends[rank], requests
+                )
+                for rank in (0, 1)
+            ]
+        )
+        assert snapshots == expected_snapshots
+        for rank, (engine, backend) in enumerate(zip(engines, backends, strict=True)):
+            stats = backend.window_stats()
+            load_count = 101 * request_count
+            save_count = load_count if rank == 0 else 101
+            host_counts = {
+                "prepare_load": load_count,
+                "prepare_save": 101,
+                "submit_load": load_count,
+                "submit_save": save_count,
+                "wait_load": load_count,
+                "complete_load": load_count,
+                "complete_save": save_count,
+                "publish": 101,
+                "drain": 1,
+            }
+            if rank == 0:
+                host_counts.update(remote_submit=2 * request_count, remote_drain=1)
+            assert {key: value[0] for key, value in stats["async_host"].items()} == (
+                host_counts
+            )
+            for calls, total_ms, max_ms in stats["async_host"].values():
+                assert calls > 0 and total_ms >= max_ms >= 0
+
+            ack_stats = engine.layerwise_prefill_ack_stats()
+            assert stats["ack"] == {
+                "calls": ack_calls,
+                "ms": round(ack_stats["total_ms"], 3),
+                "max_ms": round(ack_stats["max_ms"], 3),
+                "fast": ack_stats["fast_count"],
+                "slow": ack_stats["slow_count"],
+                "payload_bytes": ack_stats["serialized_bytes"],
+                "max_payload_bytes": ack_stats["max_payload_bytes"],
+                "phase": {
+                    phase: (
+                        values["count"],
+                        round(values["total_ms"], 3),
+                        round(values["max_ms"], 3),
+                    )
+                    for phase, values in ack_stats["by_phase"].items()
+                },
+            }
+            assert {
+                phase: values[0] for phase, values in stats["ack"]["phase"].items()
+            } == ack_counts
+            assert ack_stats["count"] == ack_calls
+            assert ack_stats["fast_count"] + ack_stats["slow_count"] == ack_calls
+            assert ack_stats["serialized_bytes"] >= ack_stats["max_payload_bytes"] > 0
+            slow_calls += ack_stats["slow_count"]
+            assert resets[rank].call_count == step
+            assert Counter(event[0] for event in engine.gpu_connector.events) == {
+                "prepare": (load_count + save_count) * step,
+                "submit": (load_count + save_count) * step,
+                "compute_wait": load_count * step,
+                "host_fence": (load_count + save_count) * step,
+                "drain": step,
+            }
+
+            snapshots.append(stats)
+            expected_snapshots.append(deepcopy(stats))
+            changed = backend.window_stats()
+            changed["async_host"].clear()
+            changed["ack"]["phase"].clear()
+            changed["ack"]["calls"] = -1
+            assert backend.window_stats() == stats
+        assert tensor_gather.call_count == 2 * ack_calls * step
+        assert object_gather.call_count == slow_calls
+        assert all(sync.call_count == step for sync in stream_syncs)
+        assert len(logger.method_calls) == len(logged) == 2 * step
+        assert all(rank == 0 for rank, _ in logged)
+        begin, end_line = [line for _, line in logged[-2:]]
+        assert f"event=begin step={step} requests={request_count}" in begin
+        assert "async_host" not in begin and "window_stats" not in begin
+        assert (
+            f"event=end step={step} requests={request_count} saved=(79, 22)" in end_line
+        )
+        assert "transfer_timing=False" in end_line
+        assert ast.literal_eval(end_line.split(" window_stats=", 1)[1]) == (
+            backends[0].window_stats()
+        )
 
 
 @pytest.mark.parametrize("request_count", [1, 4])

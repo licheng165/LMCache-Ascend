@@ -65,8 +65,10 @@ def test_real_connector_reuses_four_bind_plans_across_all_rows(
         host_ops = row_env.host_ops.copy()
         transfer(*args, kv_group=kv_group, direction=direction, timing=timing)
         assert not row_env.pending
+        # The copy-aware mock counts pointer/offset/size factories as uploads
+        # too. Only those three tables may be uploaded; slots remain prepared.
+        assert row_env.host_ops["uploads"] == host_ops["uploads"] + 3
         for operation in (
-            "uploads",
             "readback",
             "cat",
             "tolist",
@@ -94,7 +96,7 @@ def test_real_connector_reuses_four_bind_plans_across_all_rows(
         assert len(prepared) == 4 * step
         assert all(ref() is None for ref in prepared[:-4])
         assert all(ref() is not None for ref in prepared[-4:])
-        assert row_env.host_ops["uploads"] == 4 * step
+        assert row_env.host_ops["uploads"] == 4 * step + 3 * len(row_env.calls)
         before = len(row_env.calls)
         for _, latent, indexer in _view().executions:
             for key in (latent, indexer):
@@ -123,6 +125,7 @@ def test_real_connector_reuses_four_bind_plans_across_all_rows(
         )
         assert len(prepared) == 4 * step and not backend._slots
         assert all(ref() is None for ref in prepared)
-        assert row_env.host_ops["uploads"] == 4 * step
+        assert row_env.host_ops["uploads"] == 4 * step + 3 * len(row_env.calls)
+        assert sum(event[1] == "slots" for event in row_env.events) == 4 * step
         assert row_env.host_ops["readback"] == row_env.host_ops["cat"] == 0
     backend.abort_request(req.request_id)

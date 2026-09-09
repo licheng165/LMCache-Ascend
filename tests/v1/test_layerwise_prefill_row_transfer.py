@@ -55,8 +55,11 @@ class _Stream:
     def wait_stream(self, producer):
         assert self.env.active is self
         self.env.events.append((self.name, "wait", producer.name))
-        mark = len(producer.queue)
-        self.queue.append(lambda: producer.run_to(mark))
+        # torch_npu Stream.wait_stream calls producer.record_event(), which
+        # allocates a Python event and lazily creates its native handle.
+        event = torch.npu.Event()
+        event.record(producer)
+        self.wait_event(event)
 
     def wait_event(self, event):
         assert self.env.active is self or self is self.env.compute
@@ -77,11 +80,18 @@ class _Event:
         self.env = env
         self.stream = None
         self.mark = None
+        self.materialized = False
         env.events.append(("event", "allocate", self))
 
     def record(self, stream):
+        if not self.materialized:
+            assert not self.env.pre_hcom, "Native event allocation in pre-HCOM"
+            self.env.events.append(("event", "materialize", self))
+            self.materialized = True
         self.env.events.append((stream.name, "record", self))
-        if self.env.event_record_error:
+        if self.env.event_record_error is self or (
+            self.env.event_record_error is True and stream is not self.env.compute
+        ):
             raise RuntimeError("event record failed")
         self.stream, self.mark = stream, len(stream.queue)
 
@@ -98,7 +108,9 @@ def row_env(monkeypatch):
         events=[],
         calls=[],
         pending=[],
+        uploads=[],
         active=None,
+        pre_hcom=False,
         launch_error=False,
         sync_error=False,
         event_record_error=False,
@@ -144,7 +156,52 @@ def row_env(monkeypatch):
     monkeypatch.setattr(torch.npu, "current_stream", current_stream)
     monkeypatch.setattr(torch.npu, "Event", lambda: _Event(env))
     tensor_factory, tensor_to, tensor_cat = torch.tensor, torch.Tensor.to, torch.cat
+    tensor_empty, tensor_copy = torch.empty, torch.Tensor.copy_
+    tensor_is_pinned = torch.Tensor.is_pinned
     tensor_tolist, tensor_getitem = torch.Tensor.tolist, torch.Tensor.__getitem__
+
+    def upload(dst, src, non_blocking=False):
+        stream = env.active or env.compute
+        call = dict(
+            src=weakref.ref(src),
+            dst=weakref.ref(dst),
+            pinned=src.is_pinned(),
+            non_blocking=non_blocking,
+            nbytes=src.numel() * src.element_size(),
+            stream=stream,
+            complete=False,
+        )
+        env.uploads.append(call)
+        env.host_ops["uploads"] += 1
+        # Version increments at enqueue, not when the device executes the DMA.
+        torch.autograd.graph.increment_version(dst)
+
+        def dma():
+            assert call["src"]() is not None and call["dst"]() is not None
+            tensor_copy(call["dst"]().as_subclass(torch.Tensor).data, call["src"]())
+            call["complete"] = True
+
+        stream.queue.append(dma)
+        if not (non_blocking and call["pinned"]):
+            # CopyKernel synchronizes CURRENT stream, including older KV work.
+            # CachingHostAllocator does the same for pageable nonblocking copies.
+            env.events.append((stream.name, "copy_sync"))
+            stream.run_to(len(stream.queue))
+        return dst
+
+    def empty_tensor(*args, **kwargs):
+        on_npu = kwargs.get("device") is _DEVICE
+        pinned = kwargs.pop("pin_memory", False)
+        if on_npu:
+            assert env.active is not None
+            assert kwargs["dtype"] in (torch.int32, torch.int64)
+            kwargs["device"] = "cpu"
+        result = tensor_empty(*args, **kwargs)
+        if on_npu:
+            result.fill_(-999)  # Detect metadata inspected before deferred DMA.
+            return result.as_subclass(_NPUTensor)
+        result._mock_pinned = pinned
+        return result
 
     def make_tensor(*args, **kwargs):
         if kwargs.get("device") is _DEVICE:
@@ -152,16 +209,38 @@ def row_env(monkeypatch):
             assert kwargs["dtype"] in (torch.int32, torch.int64)
             env.events.append((env.active.name, "metadata", kwargs["dtype"]))
             kwargs["device"] = "cpu"
-        return tensor_factory(*args, **kwargs)
+            src = tensor_factory(*args, **kwargs)
+            dst = tensor_empty(src.shape, dtype=src.dtype).as_subclass(_NPUTensor)
+            return upload(dst, src)
+        pinned = kwargs.pop("pin_memory", False)
+        result = tensor_factory(*args, **kwargs)
+        result._mock_pinned = pinned
+        return result
+
+    def copy_tensor(dst, src, non_blocking=False):
+        if (
+            isinstance(dst, _NPUTensor)
+            and dst.dtype in (torch.int32, torch.int64)
+            and src.device.type == "cpu"
+        ):
+            return upload(dst, src, non_blocking)
+        return tensor_copy(dst, src, non_blocking=non_blocking)
+
+    def is_pinned(tensor, *args, **kwargs):
+        return getattr(tensor, "_mock_pinned", False) or tensor_is_pinned(
+            tensor, *args, **kwargs
+        )
 
     def to_tensor(tensor, *args, **kwargs):
         if kwargs.get("device") is _DEVICE:
             assert tensor.dtype in (torch.int32, torch.int64), "KV staging forbidden"
             env.events.append(((env.active or env.compute).name, "slots"))
-            env.host_ops["uploads"] += 1
             kwargs["device"] = "cpu"
+            non_blocking = kwargs.pop("non_blocking", False)
             tensor = tensor.as_subclass(torch.Tensor)
-            return tensor_to(tensor, *args, **kwargs).as_subclass(_NPUTensor)
+            src = tensor_to(tensor, *args, **kwargs)
+            dst = tensor_empty(src.shape, dtype=src.dtype).as_subclass(_NPUTensor)
+            return upload(dst, src, non_blocking)
         if kwargs.get("device") == "cpu" and isinstance(tensor, _NPUTensor):
             env.host_ops["readback"] += 1
             tensor = tensor.as_subclass(torch.Tensor)
@@ -197,6 +276,9 @@ def row_env(monkeypatch):
         return set(values)
 
     monkeypatch.setattr(torch, "tensor", make_tensor)
+    monkeypatch.setattr(torch, "empty", empty_tensor)
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_tensor)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", is_pinned)
     monkeypatch.setattr(torch.Tensor, "to", to_tensor)
     monkeypatch.setattr(torch, "cat", cat_tensors)
     monkeypatch.setattr(torch.Tensor, "tolist", tolist)
@@ -240,22 +322,17 @@ def row_env(monkeypatch):
         assert offsets.dtype == sizes.dtype == torch.int32
         assert pointers.dtype == slots.dtype == torch.int64
         assert all(t.is_contiguous() for t in (slots, offsets, sizes, pointers))
-        assert tensor_tolist(pointers) == [chunk.data_ptr() + 4096 for chunk in chunks]
         env.events.append((env.active.name, "launch"))
-        env.calls.append(
-            dict(
-                slots=tensor_tolist(slots.as_subclass(torch.Tensor)),
-                offsets=tensor_tolist(offsets),
-                sizes=tensor_tolist(sizes),
-                slot_ptr=slots.data_ptr(),
-                total=total,
-                fmt=fmt,
-                widths=(k_width, v_width, dsa_width),
-                direction=direction,
-                plane_ptrs=[plane.data_ptr() for plane in planes],
-                chunk_ptrs=[chunk.data_ptr() for chunk in chunks],
-            )
+        call = dict(
+            slot_ptr=slots.data_ptr(),
+            total=total,
+            fmt=fmt,
+            widths=(k_width, v_width, dsa_width),
+            direction=direction,
+            plane_ptrs=[plane.data_ptr() for plane in planes],
+            chunk_ptrs=[chunk.data_ptr() for chunk in chunks],
         )
+        env.calls.append(call)
         # The native ABI only owns raw pointers. Do not let the mock hide a
         # premature Python-owner release by holding strong tensor references.
         plane_refs = [weakref.ref(t) for t in planes]
@@ -268,8 +345,12 @@ def row_env(monkeypatch):
                 ref() is not None for ref in plane_refs + chunk_refs + metadata_refs
             )
             slot_values = tensor_tolist(metadata_refs[0]().as_subclass(torch.Tensor))
-            offset_values = tensor_tolist(metadata_refs[1]())
-            size_values = tensor_tolist(metadata_refs[2]())
+            offset_values = tensor_tolist(metadata_refs[1]().as_subclass(torch.Tensor))
+            size_values = tensor_tolist(metadata_refs[2]().as_subclass(torch.Tensor))
+            assert tensor_tolist(metadata_refs[3]().as_subclass(torch.Tensor)) == [
+                ref().data_ptr() + 4096 for ref in chunk_refs
+            ]
+            call.update(slots=slot_values, offsets=offset_values, sizes=size_values)
             for ref, offset, size in zip(
                 chunk_refs, offset_values, size_values, strict=True
             ):
@@ -812,7 +893,12 @@ def test_four_prepared_mappings_512_chunks_101_rows_no_repacking_or_readback(row
             assert env.calls[-1]["chunk_ptrs"] == [c.data_ptr() for c in chunks]
 
     assert len(env.calls) == 101 and not env.pending
-    assert env.host_ops == {**before, "slices": before["slices"] + 101}
+    assert env.host_ops == {
+        **before,
+        "slices": before["slices"] + 101,
+        "uploads": before["uploads"] + 303,
+    }
+    assert all(not upload["non_blocking"] for upload in env.uploads)
     assert sum(event[1] == "registered" for event in env.events) == 101 * 512
     assert sum(event[1] == "sync" for event in env.events) == 101
     for (group, bank), (planes, chunks, mapping, _, snapshots) in banks.items():
@@ -888,7 +974,7 @@ def test_consecutive_noncontiguous_mapping_and_inference_snapshot(
     if prepared:
         assert env.calls[0]["slot_ptr"] == mapping._slots.data_ptr() + 8
         assert env.host_ops["readback"] == before["readback"]
-        assert env.host_ops["uploads"] == before["uploads"]
+        assert env.host_ops["uploads"] == before["uploads"] + 3
 
 
 @pytest.mark.parametrize(
@@ -1189,6 +1275,92 @@ def _prepare_async(env, *, group=1, direction=True, slots=None):
     )
 
 
+@pytest.mark.parametrize("older_group", [0, 1])
+def test_async_prepare_latent_does_not_drain_gated_older_load(row_env, older_group):
+    env = row_env
+    plans = {
+        group: env.connector.prepare_layerwise_prefill_slots(
+            torch.tensor([4, 0, 9]), kv_group=group, capacity=12
+        )
+        for group in (0, 1)
+    }
+    older = _prepare_async(
+        env, group=older_group, direction=False, slots=plans[older_group]
+    )
+    released = False
+
+    def gate():
+        assert released, "Metadata upload drained gated older KV"
+
+    env.load.queue.append(gate)
+    env.connector.submit_layerwise_prefill_row(older)
+    completed = env.load.completed
+    before = env.host_ops.copy()
+    later = _prepare_async(env, group=0, direction=False, slots=plans[0])
+    assert env.load.completed == completed and len(env.pending) == 1
+    assert env.host_ops == {
+        **before,
+        "slices": before["slices"] + 1,
+        "uploads": before["uploads"] + 3,
+    }
+    assert all(
+        upload["pinned"] and upload["non_blocking"] and not upload["complete"]
+        for upload in env.uploads[-3:]
+    )
+    assert sum(upload["nbytes"] for upload in env.uploads[-3:]) == 2 * 16
+    chunks, planes = later._args[:2]
+    chunks[0].fill_(21)
+    chunks[1].fill_(22)
+    env.compute.queue.append(lambda: [plane.fill_(31) for plane in planes])
+    env.pre_hcom = True
+    env.connector.submit_layerwise_prefill_row(later)
+    env.connector.wait_layerwise_prefill_row(later)
+    env.pre_hcom = False
+    assert env.load.completed == completed and len(env.pending) == 2
+    assert "sizes" not in env.calls[-1]  # Native reads metadata only at execution.
+    released = True
+    env.compute.run_to(len(env.compute.queue))
+    for plane in planes:
+        flat = plane.as_subclass(torch.Tensor).view(12, -1)
+        assert bool((flat[[4, 0]] == 21).all())
+        assert bool((flat[9] == 22).all())
+        assert bool((flat[1] == 31).all())
+    assert env.calls[-1]["slots"] == [4, 0, 9]
+    assert env.calls[-1]["sizes"] == [2, 1]
+    env.connector.drain_layerwise_prefill_transfers()
+
+
+@pytest.mark.parametrize(
+    "method, pinned, non_blocking",
+    [
+        ("factory", False, False),
+        ("to", False, False),
+        ("copy", False, False),
+        ("copy", False, True),
+        ("copy", True, False),
+        ("copy", True, True),
+    ],
+)
+def test_mock_metadata_copy_models_torch_npu_current_stream_sync(
+    row_env, method, pinned, non_blocking
+):
+    env = row_env
+    payload = []
+    env.load.queue.append(lambda: payload.append("older KV"))
+    with torch.npu.stream(env.load):
+        host = torch.tensor([1, 2], dtype=torch.int32, pin_memory=pinned)
+        if method == "factory":
+            dst = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
+        elif method == "to":
+            dst = host.to(device=_DEVICE, non_blocking=non_blocking)
+        else:
+            dst = torch.empty(2, dtype=torch.int32, device=_DEVICE)
+            dst.copy_(host, non_blocking=non_blocking)
+    assert bool(payload) is not (pinned and non_blocking)
+    env.load.run_to(len(env.load.queue))
+    torch.testing.assert_close(dst.as_subclass(torch.Tensor), host)
+
+
 @pytest.mark.parametrize("group", [0, 1])
 @pytest.mark.parametrize("direction", [False, True])
 @pytest.mark.parametrize("prepared_slots", [False, True])
@@ -1214,6 +1386,17 @@ def test_async_enqueue_has_no_allocation_readback_or_host_fence(
     assert not env.connector._layerwise_prefill_inflight
     assert not any(e[1] in ("sync", "event_sync") for e in env.events)
     assert env.connector.supports_layerwise_prefill_async_rows is True
+    assert row._producer_event is not row._done_event
+    assert row._producer_event.materialized and row._done_event.materialized
+    uploads = env.uploads[-3:]
+    for upload in uploads:
+        assert upload["pinned"] and upload["non_blocking"]
+        assert not upload["complete"]
+        for name in ("src", "dst"):
+            assert any(owner is upload[name]() for owner in row._owners)
+            assert any(t is upload[name]() for t, _ in row._metadata_versions)
+    if prepared_slots:
+        assert not any(e[1] == "copy_sync" for e in env.events if e[0] != "compute")
     before = env.host_ops.copy()
     env.events.clear()
     native = npu_connectors.lmc_ops.dense_mla_dsa_batched_direct_kv_transfer
@@ -1234,7 +1417,7 @@ def test_async_enqueue_has_no_allocation_readback_or_host_fence(
         )
         for name in ("tensor", "empty", "empty_like", "zeros", "ones", "cat"):
             patch.setattr(torch, name, forbidden)
-        for name in ("clone", "to", "cpu", "tolist", "item", "__getitem__"):
+        for name in ("clone", "to", "cpu", "tolist", "item", "__getitem__", "copy_"):
             patch.setattr(torch.Tensor, name, forbidden)
         patch.setattr(torch.npu, "Event", forbidden)
         patch.setattr(_Stream, "synchronize", forbidden)
@@ -1242,14 +1425,17 @@ def test_async_enqueue_has_no_allocation_readback_or_host_fence(
         patch.setattr(npu_connectors, "perf_counter", forbidden)
         patch.setattr(env.connector, "_validate_layerwise_prefill_row", forbidden)
         patch.setattr(npu_connectors.lmc_ops, "get_device_ptr", forbidden)
+        env.pre_hcom = True
         ticket = env.connector.submit_layerwise_prefill_row(row)
         assert ticket is row
         assert env.connector.wait_layerwise_prefill_row(ticket) is None
+        env.pre_hcom = False
     assert env.host_ops == before
     stream = "store" if direction else "load"
     assert env.events == [
         (stream, "enter"),
-        (stream, "wait", "compute"),
+        ("compute", "record", row._producer_event),
+        (stream, "wait_event", row._producer_event),
         (stream, "launch"),
         (stream, "record", ticket.done_event),
         (stream, "exit"),
@@ -1262,6 +1448,7 @@ def test_async_enqueue_has_no_allocation_readback_or_host_fence(
         torch.testing.assert_close(plane.as_subclass(torch.Tensor), snapshot)
     assert all(ref() is not None for ref in env.last_refs)
     assert env.connector.complete_layerwise_prefill_row(ticket) is None
+    assert all(upload["complete"] for upload in uploads)
     assert not env.pending and not env.connector._layerwise_prefill_inflight
     assert env.events[-1] == (stream, "event_sync", ticket.done_event)
     assert not ticket._args and not ticket._owners and not ticket._tensor_identities
@@ -1282,12 +1469,15 @@ def test_async_enqueue_has_no_allocation_readback_or_host_fence(
                 offset += expected.numel()
 
 
-def test_async_post_sfa_dependency_and_compute_consumer(row_env):
+@pytest.mark.parametrize("switch_current", [False, True])
+def test_async_post_sfa_dependency_and_compute_consumer(row_env, switch_current):
     env = row_env
     row = _prepare_async(env, direction=False)
     chunks, planes = row._args[:2]
     chunks[0].fill_(21)
     chunks[1].fill_(22)
+    if switch_current:
+        env.compute = _Stream(env, "post_sfa")
     # Work added AFTER prepare must precede the native write, not overwrite it.
     env.compute.queue.append(lambda: planes[0].fill_(31))
     ticket = env.connector.submit_layerwise_prefill_row(row)
@@ -1386,12 +1576,20 @@ def test_async_metadata_snapshot_and_inference_payloads(
     assert env.calls[0]["widths"] == (32, 0, 32)
 
 
-@pytest.mark.parametrize("index", [2, 3, 4, 14])
+@pytest.mark.parametrize(
+    "index", [2, 3, 4, 14, "host_ptrs", "host_offsets", "host_sizes"]
+)
 @pytest.mark.parametrize("inference", [False, True])
 def test_async_same_value_metadata_write_is_rejected(row_env, index, inference):
     env = row_env
     row = _prepare_async(env)
-    tensor = row._args[index]
+    if isinstance(index, str):
+        host_index = ("host_ptrs", "host_offsets", "host_sizes").index(index)
+        upload = env.uploads[-3 + host_index]
+        tensor = upload["src"]()
+        assert tensor.is_pinned() and not upload["complete"]
+    else:
+        tensor = row._args[index]
     with torch.inference_mode(inference):
         tensor[0] = tensor[0]  # Even unchanged/all-ones metadata must fail closed.
     env.events.clear()
@@ -1402,6 +1600,7 @@ def test_async_same_value_metadata_write_is_rejected(row_env, index, inference):
         and not env.calls
         and not env.connector._layerwise_prefill_inflight
     )
+    env.connector.synchronize_shared_cpu_store_publication()
 
 
 @pytest.mark.parametrize(
@@ -1501,7 +1700,7 @@ def test_async_ticket_lifecycle_and_frozen_fields(row_env):
     assert sum(e[1] == "event_sync" for e in env.events) == 1
 
 
-@pytest.mark.parametrize("failure", ["launch", "record", "wait"])
+@pytest.mark.parametrize("failure", ["launch", "record", "producer_record", "wait"])
 def test_async_partial_submission_errors_are_registered_and_drained(
     row_env,
     monkeypatch,
@@ -1515,7 +1714,9 @@ def test_async_partial_submission_errors_are_registered_and_drained(
     if failure == "launch":
         env.launch_error = True
     elif failure == "record":
-        env.event_record_error = True
+        env.event_record_error = bad._done_event
+    elif failure == "producer_record":
+        env.event_record_error = bad._producer_event
     else:
         bad_id, bad_ref = id(bad), weakref.ref(bad)
 
@@ -1523,7 +1724,7 @@ def test_async_partial_submission_errors_are_registered_and_drained(
             assert env.connector._layerwise_prefill_inflight[bad_id] is bad_ref()
             raise RuntimeError("wait failed")
 
-        monkeypatch.setattr(env.store, "wait_stream", fail_wait)
+        monkeypatch.setattr(env.store, "wait_event", fail_wait)
     with pytest.raises(RuntimeError, match="failed"):
         env.connector.submit_layerwise_prefill_row(bad)
     assert list(env.connector._layerwise_prefill_inflight.values()) == [good, bad]
@@ -1531,7 +1732,16 @@ def test_async_partial_submission_errors_are_registered_and_drained(
     assert bad._recorded is False  # Preparation's stale event is not completion.
     with pytest.raises(ValueError):
         env.connector.wait_layerwise_prefill_row(bad)
-    refs = good_refs + env.last_refs
+    refs = (
+        good_refs
+        + env.last_refs
+        + [
+            upload[name]
+            for upload in env.uploads
+            if upload["non_blocking"]
+            for name in ("src", "dst")
+        ]
+    )
     del good, bad
     gc.collect()
     assert all(ref() is not None for ref in refs)
@@ -1563,6 +1773,7 @@ def test_async_unknown_fence_poison_quarantines_owners_and_drain_retries(
 ):
     env = row_env
     row = _prepare_async(env)
+    upload_refs = [u[name] for u in env.uploads[-3:] for name in ("src", "dst")]
     env.launch_error = partial
     if partial:
         with pytest.raises(RuntimeError, match="native launch failed"):
@@ -1575,7 +1786,7 @@ def test_async_unknown_fence_poison_quarantines_owners_and_drain_retries(
     assert row._owners and env.pending
     assert env.connector._layerwise_prefill_inflight[id(row)] is row
     gc.collect()
-    assert all(ref() is not None for ref in env.last_refs)
+    assert all(ref() is not None for ref in env.last_refs + upload_refs)
     for action in (
         lambda: _prepare_async(env),
         lambda: env.connector.submit_layerwise_prefill_row(row),
@@ -1597,7 +1808,7 @@ def test_async_unknown_fence_poison_quarantines_owners_and_drain_retries(
     assert not row._owners and not env.pending
     assert not env.connector._layerwise_prefill_inflight
     gc.collect()
-    assert all(ref() is None for ref in env.last_refs)
+    assert all(ref() is None for ref in env.last_refs + upload_refs)
 
 
 def test_async_drain_attempts_remaining_rows_after_failed_event_fence(
@@ -1658,7 +1869,17 @@ def test_async_hooks_reject_storage_executor_thread(row_env, monkeypatch):
     assert not env.calls
 
 
-@pytest.mark.parametrize("failure", ["registration", "allocation", "event"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "registration",
+        "allocation",
+        "host_allocation",
+        "copy_before",
+        "copy_after",
+        "event",
+    ],
+)
 @pytest.mark.parametrize("fence_fails", [False, True])
 def test_async_preparation_failure_fences_metadata_or_quarantines(
     row_env,
@@ -1672,26 +1893,60 @@ def test_async_preparation_failure_fences_metadata_or_quarantines(
         env.pointer_error = "raise"
     elif failure == "event":
         env.event_record_error = True
+    elif failure.startswith("copy_"):
+        prepare = env.connector._prepare_layerwise_prefill_row_metadata
+        tensor_copy = torch.Tensor.copy_
+
+        def preparing(validated, direction, owners, **kwargs):
+            env.preparing_owners = owners
+            try:
+                return prepare(validated, direction, owners, **kwargs)
+            finally:
+                env.preparing_owners = None
+
+        def fail_copy(dst, src, non_blocking=False):
+            assert non_blocking and src.is_pinned()
+            assert any(owner is src for owner in env.preparing_owners)
+            assert any(owner is dst for owner in env.preparing_owners)
+            if dst.dtype == torch.int32 and failure == "copy_before":
+                raise RuntimeError("metadata copy failed before enqueue")
+            result = tensor_copy(dst, src, non_blocking=non_blocking)
+            if dst.dtype == torch.int32:
+                raise RuntimeError("metadata copy failed after enqueue")
+            return result
+
+        monkeypatch.setattr(
+            env.connector, "_prepare_layerwise_prefill_row_metadata", preparing
+        )
+        monkeypatch.setattr(torch.Tensor, "copy_", fail_copy)
     else:
-        factory = torch.tensor
+        name = "tensor" if failure == "host_allocation" else "empty"
+        factory = getattr(torch, name)
 
         def fail_sizes(*args, **kwargs):
-            if kwargs.get("device") is _DEVICE and kwargs.get("dtype") == torch.int32:
+            if kwargs.get("dtype") == torch.int32 and (
+                kwargs.get("device") is _DEVICE or kwargs.get("pin_memory")
+            ):
                 raise RuntimeError("metadata allocation failed")
             return factory(*args, **kwargs)
 
-        monkeypatch.setattr(torch, "tensor", fail_sizes)
+        monkeypatch.setattr(torch, name, fail_sizes)
     with pytest.raises(RuntimeError, match="failed"):
         _prepare_async(env)
     assert not env.calls and not env.connector._layerwise_prefill_inflight
     assert env.events[-1] == ("store", "sync")
+    if failure != "registration":
+        assert any(upload["non_blocking"] for upload in env.uploads)
+    if failure == "copy_after":
+        assert sum(upload["non_blocking"] for upload in env.uploads) == 2
     if fence_fails:
         assert env.connector._layerwise_prefill_row_failed_owners
         refs = [
             weakref.ref(owner)
             for owner in env.connector._layerwise_prefill_row_failed_owners
-            if isinstance(owner, torch.Tensor)
+            if isinstance(owner, (torch.Tensor, _Event))
         ]
+        env.events.clear()  # Event tracing must not mask lost connector ownership.
         gc.collect()
         assert all(ref() is not None for ref in refs)
         with pytest.raises(RuntimeError, match="completion failed"):
@@ -1706,6 +1961,112 @@ def test_async_preparation_failure_fences_metadata_or_quarantines(
         assert (
             getattr(env.connector, "_layerwise_prefill_row_failed_owners", None) is None
         )
+    assert all(upload["complete"] for upload in env.uploads)
+
+
+@pytest.mark.parametrize("recognition", ["false", "missing", "error"])
+def test_async_metadata_requires_recognized_pinned_allocator(
+    row_env, monkeypatch, recognition
+):
+    env = row_env
+    slots = env.connector.prepare_layerwise_prefill_slots(
+        torch.tensor([4, 0, 9]), kv_group=1, capacity=12
+    )
+    before = len(env.uploads)
+
+    def is_pinned(_tensor):
+        if recognition == "error":
+            raise RuntimeError("pinned recognition unavailable")
+        return False
+
+    monkeypatch.setattr(
+        torch.Tensor, "is_pinned", None if recognition == "missing" else is_pinned
+    )
+    with pytest.raises(RuntimeError, match="pinned"):
+        _prepare_async(env, slots=slots)
+    assert len(env.uploads) == before and not env.calls
+    assert env.events[-1] == ("store", "sync")
+
+
+@pytest.mark.parametrize("fence_fails", [False, True])
+def test_async_unsubmitted_metadata_owners_survive_existing_abort_fences(
+    row_env, fence_fails
+):
+    env = row_env
+    slots = env.connector.prepare_layerwise_prefill_slots(
+        torch.tensor([4, 0, 9]), kv_group=1, capacity=12
+    )
+    rows = [_prepare_async(env, direction=d, slots=slots) for d in (False, True)]
+    uploads = env.uploads[1:]
+    refs = [upload[name] for upload in uploads for name in ("src", "dst")]
+    env.connector.drain_layerwise_prefill_transfers()
+    assert not env.connector._layerwise_prefill_inflight
+    assert all(not upload["complete"] for upload in uploads)
+    # Backend abort retains prepared tickets and fences BOTH existing streams,
+    # including work with no KV submission/completion event in the registry.
+    env.sync_error = fence_fails
+    for fence in (
+        env.connector.synchronize_dense_load_stream,
+        env.connector.synchronize_shared_cpu_store_publication,
+    ):
+        if fence_fails:
+            with pytest.raises(RuntimeError, match="completion failed"):
+                fence()
+        else:
+            fence()
+    gc.collect()
+    assert all(ref() is not None for ref in refs)
+    if fence_fails:
+        assert all(not upload["complete"] for upload in uploads)
+        env.sync_error = False
+        env.connector.synchronize_dense_load_stream()
+        env.connector.synchronize_shared_cpu_store_publication()
+    assert all(upload["complete"] for upload in uploads) and not env.calls
+    del rows
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
+def test_async_101_rows_four_banks_upload_only_pinned_chunk_metadata(row_env):
+    env = row_env
+    slots = {
+        (group, bank): env.connector.prepare_layerwise_prefill_slots(
+            torch.tensor([4, 0, 9]), kv_group=group, capacity=12
+        )
+        for group in (0, 1)
+        for bank in (0, 1)
+    }
+    before = env.host_ops.copy()
+    for group, count in ((0, 79), (1, 22)):
+        for _ in range(count):
+            for bank in (0, 1):
+                row = _prepare_async(
+                    env, group=group, direction=not bank, slots=slots[group, bank]
+                )
+                env.connector.submit_layerwise_prefill_row(row)
+    del row
+    assert len(env.pending) == 202
+    assert env.host_ops == {
+        **before,
+        "uploads": before["uploads"] + 606,
+        "slices": before["slices"] + 202,
+    }
+    uploads = env.uploads[4:]
+    assert len(uploads) == 606
+    assert all(
+        upload["non_blocking"] and upload["pinned"] and not upload["complete"]
+        for upload in uploads
+    )
+    assert sum(upload["nbytes"] for upload in uploads) == 202 * 2 * 16
+    assert not any(
+        e[1] in ("sync", "event_sync", "copy_sync")
+        for e in env.events
+        if e[0] != "compute"
+    )
+    env.connector.drain_layerwise_prefill_transfers()
+    gc.collect()
+    assert all(upload["complete"] for upload in uploads)
+    assert all(upload[name]() is None for upload in uploads for name in ("src", "dst"))
 
 
 def test_async_partial_launch_and_failed_complete_preserves_both_errors(row_env):
@@ -1746,17 +2107,27 @@ def test_async_512_chunk_metadata_is_row_owned_and_never_refilled(row_env):
     )
     small = _prepare_async(env)
     assert first._args[4].data_ptr() != small._args[4].data_ptr()
-    snapshots = tuple(t.clone() for t, _ in first._metadata_versions)
+    snapshots = tuple(
+        (t, version, t.clone())
+        for t, version in first._metadata_versions
+        if t.device.type == "cpu"
+    )
+    assert len(snapshots) == 3
+    assert sum(t.numel() * t.element_size() for t, _, _ in snapshots) == 512 * 16
     before = env.host_ops.copy()
     env.connector.submit_layerwise_prefill_row(first)
     env.connector.submit_layerwise_prefill_row(small)
     assert env.host_ops == before
+    assert "sizes" not in env.calls[0]
+    env.store.run_to(len(env.store.queue))
     assert env.calls[0]["sizes"] == sizes
     assert env.calls[0]["offsets"] == list(range(512))
-    for (tensor, version), snapshot in zip(
-        first._metadata_versions, snapshots, strict=True
-    ):
+    for tensor, version, snapshot in snapshots:
         assert tensor._version == version
         torch.testing.assert_close(tensor, snapshot)
+    for upload in env.uploads[1:4]:
+        torch.testing.assert_close(
+            upload["dst"]().as_subclass(torch.Tensor), upload["src"]()
+        )
     env.connector.drain_layerwise_prefill_transfers()
     assert not env.pending

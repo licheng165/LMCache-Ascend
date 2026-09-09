@@ -10,7 +10,7 @@ The shared step Future is an assembly/commit barrier, not an admission credit.
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Any, Iterator, NoReturn
+from typing import Any, Callable, Iterator, NoReturn
 
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
@@ -89,6 +89,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         self._job_id = 0
         self._device_jobs = self._remote_jobs = 0
         self._peak_jobs = self._peak_bytes = self._peak_futures = 0
+        self._host_timings: dict[str, tuple[int, float, float]] = {}
 
     def configure_window_limits(
         self, max_jobs: int, max_bytes: int, max_futures: int
@@ -124,6 +125,10 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             raise failure_type(
                 "Async backend is poisoned; restart worker"
             ) from self._failure_error
+        self._host_timings = {}
+        # Include window_bind and the inherited direct bind ACK; the sync
+        # backend resets its own row-only counters later during bind.
+        self._engine.reset_layerwise_prefill_ack_stats()
         error = validation_error
         registered = {}
         generations = ()
@@ -262,9 +267,15 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         """Return pending remote child futures; the assembly Future costs no slot."""
         return self._queue.pending_futures if self._queue is not None else 0
 
-    def window_stats(self) -> dict[str, int]:
-        """Return this step's limits, peaks, pending counts and actual job counts."""
+    def window_stats(self) -> dict[str, Any]:
+        """Return budgets and host diagnostics in the existing root step record.
+
+        Per-phase triples are (calls, total_ms, max_ms). ACK times are nested in
+        their enclosing callback scopes; publication also includes its save ACK.
+        No duration here is an isolated NPU kernel or measured overlap interval.
+        """
         stats = self._queue.stats() if self._queue is not None else {}
+        ack = self._engine.layerwise_prefill_ack_stats()
         return {
             "max_jobs": self._limits[0],
             "max_bytes": self._limits[1],
@@ -278,6 +289,27 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             "actual_jobs": self._device_jobs + self._remote_jobs,
             "device_jobs": self._device_jobs,
             "remote_jobs": self._remote_jobs,
+            "async_host": {
+                phase: (count, round(total * 1000, 3), round(maximum * 1000, 3))
+                for phase, (count, total, maximum) in self._host_timings.items()
+            },
+            "ack": {
+                "calls": ack["count"],
+                "ms": round(ack["total_ms"], 3),
+                "max_ms": round(ack["max_ms"], 3),
+                "fast": ack["fast_count"],
+                "slow": ack["slow_count"],
+                "payload_bytes": ack["serialized_bytes"],
+                "max_payload_bytes": ack["max_payload_bytes"],
+                "phase": {
+                    phase: (
+                        values["count"],
+                        round(values["total_ms"], 3),
+                        round(values["max_ms"], 3),
+                    )
+                    for phase, values in ack["by_phase"].items()
+                },
+            },
         }
 
     def wait_for_load(
@@ -302,7 +334,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         try:
             if current.consumed:
                 raise ValueError("Duplicate async row entry")
-            self._prepare_save(current)
+            self._timed_call("prepare_save", self._prepare_save, current)
         except Exception as exc:
             error = exc
         self._prepared_ack(("prepare_save", group, row), error)
@@ -313,7 +345,11 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             if not current.load_submitted:
                 self._enqueue_load(current)
             for ticket in current.loads:
-                self._engine.gpu_connector.wait_layerwise_prefill_row(ticket)
+                self._timed_call(
+                    "wait_load",
+                    self._engine.gpu_connector.wait_layerwise_prefill_row,
+                    ticket,
+                )
         except Exception as exc:
             error = exc
         self._prepared_ack(("load_ready", current.identity), error)
@@ -351,7 +387,11 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             self._peak_jobs = max(self._peak_jobs, self.pending_jobs())
             self._peak_bytes = max(self._peak_bytes, self.pending_bytes())
             for ticket in record.stores:
-                self._engine.gpu_connector.submit_layerwise_prefill_row(ticket)
+                self._timed_call(
+                    "submit_save",
+                    self._engine.gpu_connector.submit_layerwise_prefill_row,
+                    ticket,
+                )
             self._bank_events[group, bank] = record.stores[-1].done_event
         except Exception as exc:
             self._pending_error = self._pending_error or exc
@@ -396,8 +436,15 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             if not record.save_submitted or record.finished:
                 raise ValueError("Async finish is missing its submit or duplicated")
             if error is None:
-                for ticket in (*record.loads, *record.stores):
-                    self._engine.gpu_connector.complete_layerwise_prefill_row(ticket)
+                for phase, tickets in (
+                    ("complete_load", record.loads), ("complete_save", record.stores)
+                ):
+                    for ticket in tickets:
+                        self._timed_call(
+                            phase,
+                            self._engine.gpu_connector.complete_layerwise_prefill_row,
+                            ticket,
+                        )
         except Exception as exc:
             error = error or exc
         if error is not None:
@@ -405,6 +452,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             if isinstance(drained, LayerwisePrefillFenceError):
                 error = drained
         self._ack(("source_done", None if record is None else record.identity), error)
+        publication_started = perf_counter()
         root = self._engine.metadata.is_first_rank()
         for source in record.sources:
             error = None
@@ -445,6 +493,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             )
             source.fresh = []  # Ownership moved into the committed manifest.
             self._published_handles += len(objects)
+        self._record_host_time("publish", perf_counter() - publication_started)
         record.finished = True
         record.loads.clear()
         record.stores.clear()
@@ -471,7 +520,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
 
     def finish_step(self) -> None:
         """Drain every device operation first, then validate and commit 79/22 rows."""
-        error = self._drain_devices()
+        error = self._timed_call("drain", self._drain_devices)
         if error is None:
             error = self._pending_error
         self._ack(("device_finish",), error)
@@ -800,14 +849,20 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         ends: list,
         direction: bool,
     ) -> Any:
-        return self._engine.gpu_connector.prepare_layerwise_prefill_row(
+        prepare = self._engine.gpu_connector.prepare_layerwise_prefill_row
+        args = (
             self._caches[key[0]],
             [obj.tensor for obj in objects],
             starts,
             ends,
             self._slots[req.request_id, key[4], key[2]],
-            kv_group=key[2],
-            direction=direction,
+        )
+        if direction:
+            # Store preparation is included in prepare_save, including CPU
+            # allocation/pinning/key planning, rather than double-counted here.
+            return prepare(*args, kv_group=key[2], direction=True)
+        return self._timed_call(
+            "prepare_load", prepare, *args, kv_group=key[2], direction=False
         )
 
     def _enqueue_load(self, record: _AsyncRow) -> None:
@@ -816,9 +871,25 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         record.load_submitted = True
         event = self._bank_events.get((record.key[2], record.key[4]))
         for ticket in record.loads:
-            self._engine.gpu_connector.submit_layerwise_prefill_row(
-                ticket, wait_event=event
+            self._timed_call(
+                "submit_load",
+                self._engine.gpu_connector.submit_layerwise_prefill_row,
+                ticket,
+                wait_event=event,
             )
+
+    def _timed_call(
+        self, phase: str, function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        started = perf_counter()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self._record_host_time(phase, perf_counter() - started)
+
+    def _record_host_time(self, phase: str, seconds: float) -> None:
+        count, total, maximum = self._host_timings.get(phase, (0, 0.0, 0.0))
+        self._host_timings[phase] = (count + 1, total + seconds, max(maximum, seconds))
 
     def _prepared_ack(self, identity: tuple, error: Exception | None) -> None:
         if error is not None:
@@ -961,7 +1032,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                     obj.ref_count_down()
                 raise self._storage_error(exc) from exc
         try:
-            self._queue.submit(keys, objects)
+            self._timed_call("remote_submit", self._queue.submit, keys, objects)
         except BaseException as exc:
             # RequiredPutQueue consumes loans and drains before any exit,
             # including KeyboardInterrupt/SystemExit from workers/admission.
@@ -971,6 +1042,6 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
     def _drain_required_remote(self) -> None:
         if self._queue is not None:
             try:
-                self._queue.close()
+                self._timed_call("remote_drain", self._queue.close)
             except BaseException as exc:
                 raise self._storage_error(exc) from exc

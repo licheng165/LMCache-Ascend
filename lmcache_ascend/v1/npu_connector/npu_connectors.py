@@ -1501,6 +1501,7 @@ class _PreparedLayerwisePrefillRow:
     _stream: Any
     _direction: bool
     _done_event: Any
+    _producer_event: Any
     _args: tuple = ()
     _owners: tuple = ()
     _tensor_identities: tuple = ()
@@ -1923,8 +1924,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         direction: bool,
         owners: list,
         *,
-        snapshot: bool = False,
+        upload_sources: Optional[list[torch.Tensor]] = None,
     ) -> tuple:
+        """Build native args; upload_sources selects the private async snapshot path."""
         (
             layout,
             planes,
@@ -1949,7 +1951,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if prepared is not None and consecutive:
             slots_npu = slots
         else:
-            if snapshot:
+            if upload_sources is not None:
                 slots = slots.detach().to(device="cpu", dtype=torch.int64).clone()
                 owners.append(slots)
             slot_values = slots.detach().to(device="cpu").tolist()
@@ -1972,12 +1974,37 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         ]
         if any(ptr <= 0 for ptr in pointers):
             raise RuntimeError("Prefill row CPU registered pointer must be positive")
-        pointers_npu = torch.tensor(pointers, dtype=torch.int64, device=device)
-        owners.append(pointers_npu)
-        offsets_npu = torch.tensor(offsets, dtype=torch.int32, device=device)
-        owners.append(offsets_npu)
-        sizes_npu = torch.tensor(sizes, dtype=torch.int32, device=device)
-        owners.append(sizes_npu)
+        if upload_sources is not None:
+            metadata_npu = []
+            # Blocking factories, and even pageable nonblocking H2D, drain the
+            # CURRENT NPU stream, including older lookahead KV. Torch-allocator
+            # pinned sources avoid that fence; metadata costs 16 bytes/chunk.
+            for values, dtype in (
+                (pointers, torch.int64),
+                (offsets, torch.int32),
+                (sizes, torch.int32),
+            ):
+                host = torch.tensor(values, dtype=dtype, device="cpu", pin_memory=True)
+                owners.append(host)
+                is_pinned = getattr(host, "is_pinned", None)
+                if not callable(is_pinned) or not is_pinned():
+                    raise RuntimeError(
+                        "Prefill row metadata requires pinned CPU memory"
+                    )
+                dst = torch.empty(host.shape, dtype=dtype, device=device)
+                owners.append(dst)
+                upload_sources.append(host)
+                # A copy can raise after enqueue: retain BOTH owners beforehand.
+                dst.copy_(host, non_blocking=True)
+                metadata_npu.append(dst)
+            pointers_npu, offsets_npu, sizes_npu = metadata_npu
+        else:
+            pointers_npu = torch.tensor(pointers, dtype=torch.int64, device=device)
+            owners.append(pointers_npu)
+            offsets_npu = torch.tensor(offsets, dtype=torch.int32, device=device)
+            owners.append(offsets_npu)
+            sizes_npu = torch.tensor(sizes, dtype=torch.int32, device=device)
+            owners.append(sizes_npu)
         return (
             chunks,
             planes,
@@ -2104,14 +2131,18 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         """Prepare a single-submit asynchronous row outside the pre-HCOM region.
 
         Geometry, direction and packing match transfer_layerwise_prefill_row.
-        All allocations, registration lookups and slot validation happen here.
-        Metadata is queued on the selected transfer stream after the current
-        compute stream (including prepared slot uploads); submit uses that same
-        transfer stream and adds a fresh post-SFA compute dependency.
+        Tensor/event allocations, native event-handle materialization, registration
+        lookups and slot validation happen here. Private pinned CPU metadata is
+        uploaded nonblocking on the selected transfer stream after the current
+        compute stream (including prepared slot uploads). Raw/nonconsecutive slot
+        mappings retain the synchronous validation/upload fallback. Submit uses
+        that same transfer stream and adds a fresh post-SFA compute dependency
+        with the preallocated producer event, separate from the completion event.
 
         Call all async hooks on one model/control thread, never a storage worker.
         Keep CPU allocations registered and do not recycle/write payload storage
         until completion. Preparation snapshots metadata, not KV payload contents.
+        Retain unsubmitted rows until abort cleanup fences both metadata streams.
         Empty chunks/ranges produce an event-only ticket, even without a layout.
         """
         self._check_layerwise_prefill_thread()
@@ -2131,25 +2162,31 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layout = validated[0] if validated is not None else None
         device = layout.kv_device if layout is not None else stream.device
         owners: list[Any] = []
+        upload_sources: list[torch.Tensor] = []
         if validated is not None:
             owners.extend((validated[1], validated[2], slot_mapping))
         with torch.inference_mode(False), torch.npu.device(device):
             compute = torch.npu.current_stream(device)
             try:
                 with torch.npu.stream(stream):
-                    stream.wait_stream(compute)
+                    producer = torch.npu.Event()
+                    owners.append(producer)
+                    producer.record(compute)
+                    stream.wait_event(producer)
                     args = (
                         self._prepare_layerwise_prefill_row_metadata(
-                            validated, direction, owners, snapshot=True
+                            validated, direction, owners, upload_sources=upload_sources
                         )
                         if validated is not None
                         else ()
                     )
                     done = torch.npu.Event()
+                    owners.append(done)
                     # NPU events allocate their native handle lazily on first
-                    # record. Materialize it here, then re-record at submit.
+                    # record. Materialize BOTH here, then re-record at submit.
                     done.record(stream)
                     metadata = (args[2], args[3], args[4], args[14]) if args else ()
+                    metadata += tuple(upload_sources)
                     if (
                         isinstance(slot_mapping, _PreparedLayerwisePrefillSlots)
                         and args
@@ -2166,6 +2203,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         stream,
                         direction,
                         done,
+                        producer,
                         _args=args,
                         _owners=tuple(owners),
                         _tensor_identities=tuple(
@@ -2208,6 +2246,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     ) -> _PreparedLayerwisePrefillRow:
         """Enqueue only: post-SFA compute wait, optional bank wait, launch, event.
 
+        Re-records pre-materialized events; wait_stream would allocate a new one.
         Returns the prepared object as its stateful ticket. On any enqueue error,
         owners remain registered even though this method raises; defer handling
         until post-HCOM and call drain_layerwise_prefill_transfers.
@@ -2247,7 +2286,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             with torch.npu.device(prepared._device):
                 compute = torch.npu.current_stream(prepared._device)
                 with torch.npu.stream(stream):
-                    stream.wait_stream(compute)
+                    prepared._producer_event.record(compute)
+                    stream.wait_event(prepared._producer_event)
                     if wait_event is not None:
                         stream.wait_event(wait_event)
                     if prepared._args:

@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("prepared_slots", [False, True])
 @torch.inference_mode()
 def test_native_async_row_roundtrip_with_tail_and_compute_consumer(
-    group, prepared_slots
+    group, prepared_slots, monkeypatch
 ):
     from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -28,6 +28,8 @@ def test_native_async_row_roundtrip_with_tail_and_compute_consumer(
     )
     import lmcache_ascend.c_ops as lmc_ops
 
+    metadata_uploads = []
+
     class NoKVCopy(TorchDispatchMode):
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             if func._schema.name in ("aten::_to_copy", "aten::copy_", "aten::clone"):
@@ -35,6 +37,13 @@ def test_native_async_row_roundtrip_with_tail_and_compute_consumer(
                     isinstance(t, torch.Tensor) and t.dtype == torch.bfloat16
                     for t in args
                 ), "KV staging/D2D copy inside a row hook"
+            if func._schema.name == "aten::copy_" and args[0].device.type == "npu":
+                dst, host = args[:2]
+                assert dst.dtype == host.dtype
+                assert dst.dtype in (torch.int32, torch.int64)
+                assert host.device.type == "cpu" and host.is_pinned()
+                assert args[2] if len(args) > 2 else (kwargs or {}).get("non_blocking")
+                metadata_uploads.append(host.numel() * host.element_size())
             return func(*args, **(kwargs or {}))
 
     device = torch.device("npu", torch.npu.current_device())
@@ -102,10 +111,24 @@ def test_native_async_row_roundtrip_with_tail_and_compute_consumer(
                 direction=False,
                 slot_mapping_base=100,
             )
+        assert len(metadata_uploads) == 6
+        assert sum(metadata_uploads) == 2 * 2 * 16
+        for row in (store, load):
+            assert row._producer_event is not row._done_event
+            assert row._producer_event.npu_event and row._done_event.npu_event
+            sources = [t for t, _ in row._metadata_versions if t.device.type == "cpu"]
+            assert len(sources) == 3 and all(t.is_pinned() for t in sources)
+            assert all(not torch.is_inference(t) for t in sources)
         # A producer queued after preparation must be covered by submit's wait.
         for index, plane in enumerate(src):
             plane.fill_(10 + index)
-        with NoKVCopy():
+
+        def no_event_allocation(*_args, **_kwargs):
+            pytest.fail("Event allocation during pre-HCOM submission")
+
+        with NoKVCopy(), monkeypatch.context() as patch:
+            patch.setattr(torch.npu, "Event", no_event_allocation)
+            patch.setattr("torch_npu.npu.streams.Event", no_event_allocation)
             connector.submit_layerwise_prefill_row(store)
             connector.submit_layerwise_prefill_row(load, wait_event=store.done_event)
             connector.wait_layerwise_prefill_row(load)
@@ -131,4 +154,8 @@ def test_native_async_row_roundtrip_with_tail_and_compute_consumer(
         assert not store._owners and not load._owners
     finally:
         connector.drain_layerwise_prefill_transfers()
+        # Preparation can succeed without submission; backend abort also fences
+        # both metadata streams before dropping those tickets or registered KV.
+        connector.synchronize_dense_load_stream()
+        connector.synchronize_shared_cpu_store_publication()
         lmc_ops.free_pinned_ptr(ptr)

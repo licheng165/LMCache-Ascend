@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 from weakref import WeakSet
 import json
 import os
+import pickle
 import queue
+import struct
 import threading
 import time
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
@@ -75,6 +77,27 @@ logger = init_logger(__name__)
 LOCAL_CPU_BACKEND_NAME = "LocalCPUBackend"
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
+_LAYERWISE_ACK_CAPACITY = 4096
+_LAYERWISE_ACK_HEADER = struct.Struct("!BI")
+_LAYERWISE_ACK_PHASES = frozenset(
+    (
+        "bind",
+        "window_bind",
+        "validate",
+        "load",
+        "save",
+        "finish",
+        "commit",
+        "prepare_save",
+        "load_ready",
+        "source_done",
+        "device_finish",
+        "abort_devices",
+        "prepare_load",
+        "load_prepared",
+        "failed_step_drained",
+    )
+)
 
 
 def _layerwise_prefill_p_node_enabled() -> bool:
@@ -742,47 +765,202 @@ class AscendLMCacheEngine(LMCacheEngine):
             self._memory_format_for_kv_group(group),
         )
 
+    def reset_layerwise_prefill_ack_stats(self) -> None:
+        """Reset model-thread ACK counters, including bind and failure handshakes."""
+        self._layerwise_prefill_ack_stats = dict(
+            count=0,
+            total_ms=0.0,
+            max_ms=0.0,
+            serialized_bytes=0,
+            max_payload_bytes=0,
+            fast_count=0,
+            slow_count=0,
+            by_phase={},
+        )
+
+    def layerwise_prefill_ack_stats(self) -> dict[str, Any]:
+        """Return an independent, bounded snapshot of host-only ACK statistics.
+
+        Times use perf_counter, not device timing. Byte counts describe local
+        pickled statuses (excluding packet headers/padding and slow-path rework).
+        Fast/slow counts include failed transport attempts; a failed packet
+        gather counts as fast unless the shared packets selected the fallback.
+        Single-rank calls count/time the check but do not serialize or transport.
+        Unknown phase names share the 'other' bucket; no identities are retained.
+        """
+        if getattr(self, "_layerwise_prefill_ack_stats", None) is None:
+            self.reset_layerwise_prefill_ack_stats()
+        stats = self._layerwise_prefill_ack_stats
+        return {
+            **stats,
+            "by_phase": {
+                phase: dict(values) for phase, values in stats["by_phase"].items()
+            },
+        }
+
     def layerwise_prefill_ack(
         self, identity: Any, error: Optional[Exception] = None
     ) -> None:
         """Acknowledge one synchronous phase on every TP CPU rank, or raise on all.
 
         Unlike rank0's possibly one-way MQ broadcast, the CPU collective also
-        carries passive-rank failures. Call only outside graph capture.
+        carries passive-rank failures. Fitting full statuses need one tensor
+        all-gather; every rank selects the object fallback from the same packets,
+        regardless of its local phase/error/size. Mixed protocol builds are not
+        supported. Call only on the model thread, outside graph capture.
         """
-        status = (
-            identity,
-            None if error is None else f"{type(error).__name__}: {error}",
-            isinstance(error, LayerwisePrefillFenceError),
-        )
-        statuses = [status]
-        if self.metadata.world_size > 1:
-            from vllm.distributed.parallel_state import get_tp_group
-
-            statuses = [None] * self.metadata.world_size
+        started = time.perf_counter()
+        payload_bytes = fast_count = slow_count = 0
+        buffers = None
+        try:
+            world_size = self.metadata.world_size
+            payload = b""
+            serial_failed = False
             try:
-                torch.distributed.all_gather_object(
-                    statuses, status, group=get_tp_group().cpu_group
+                status = (
+                    identity,
+                    None if error is None else f"{type(error).__name__}: {error}",
+                    isinstance(error, LayerwisePrefillFenceError),
                 )
+                if world_size > 1:
+                    payload = pickle.dumps(status, protocol=pickle.HIGHEST_PROTOCOL)
             except Exception as exc:
-                raise LayerwisePrefillFenceError(
-                    "Layerwise-prefill TP acknowledgement failed; "
-                    "peer device completion is unknown"
-                ) from exc
-        failures = [
-            (rank, "identity mismatch" if item[0] != identity else None, item[1])
-            for rank, item in enumerate(statuses)
-            if item[0] != identity or item[1] is not None
-        ]
-        if failures:
-            failure_type = (
-                LayerwisePrefillFenceError
-                if any(item[2] for item in statuses)
-                else ValueError
-            )
-            raise failure_type(
-                f"Layerwise-prefill TP phase failed: {failures!r}"
-            ) from error
+                # An unpickleable identity (or broken exception __str__) must
+                # reach the peers as a plain error, never strand their ACK.
+                serial_failed = True
+                status = (
+                    None,
+                    f"ACK status serialization failed: {type(exc).__name__}",
+                    isinstance(error, LayerwisePrefillFenceError),
+                )
+                if world_size > 1:
+                    payload = pickle.dumps(status, protocol=pickle.HIGHEST_PROTOCOL)
+            payload_bytes = len(payload)
+            statuses = [status]
+            if world_size > 1:
+                from vllm.distributed.parallel_state import get_tp_group
+
+                try:
+                    group = get_tp_group().cpu_group
+                    buffers = getattr(self, "_layerwise_prefill_ack_buffers", None)
+                    if (
+                        buffers is None
+                        or buffers[0] is not group
+                        or buffers[1] != world_size
+                    ):
+                        # frombuffer is always CPU. Normal tensors are required
+                        # even when the first ACK runs inside inference_mode.
+                        with torch.inference_mode(False):
+                            packet = bytearray(_LAYERWISE_ACK_CAPACITY)
+                            packets = [
+                                bytearray(_LAYERWISE_ACK_CAPACITY)
+                                for _ in range(world_size)
+                            ]
+                            tensor = torch.frombuffer(packet, dtype=torch.uint8)
+                            tensors = [
+                                torch.frombuffer(p, dtype=torch.uint8) for p in packets
+                            ]
+                        buffers = (group, world_size, packet, tensor, packets, tensors)
+                        self._layerwise_prefill_ack_buffers = buffers
+                    _, _, packet, tensor, packets, tensors = buffers
+                    header = _LAYERWISE_ACK_HEADER
+                    fits = (
+                        not serial_failed
+                        and 0 < payload_bytes <= len(packet) - header.size
+                    )
+                    # Length includes the flag and length header. Zero means
+                    # object fallback, including a serialization error status.
+                    header.pack_into(
+                        packet, 0, int(fits), header.size + payload_bytes if fits else 0
+                    )
+                    if fits:
+                        packet[header.size : header.size + payload_bytes] = payload
+                    fast_count = 1
+                    torch.distributed.all_gather(tensors, tensor, group=group)
+                    lengths = []
+                    for peer in packets:
+                        if len(peer) != _LAYERWISE_ACK_CAPACITY:
+                            break
+                        flag, length = header.unpack_from(peer)
+                        # Check all shared packets before any Python decoding.
+                        # STOP also detects a payload truncated into zero padding.
+                        if (
+                            flag != 1
+                            or not header.size < length <= len(peer)
+                            or peer[length - 1] != pickle.STOP[0]
+                        ):
+                            break
+                        lengths.append(length)
+                    if len(lengths) != world_size:
+                        fast_count, slow_count = 0, 1
+                        gathered_payloads = [None] * world_size
+                        # Gather bytes, not arbitrary objects a second time:
+                        # a stateful serializer must not fail before this rendezvous.
+                        torch.distributed.all_gather_object(
+                            gathered_payloads, payload, group=group
+                        )
+                        statuses = [pickle.loads(p) for p in gathered_payloads]
+                    else:
+                        statuses = [
+                            pickle.loads(peer[header.size : length])
+                            for peer, length in zip(packets, lengths, strict=True)
+                        ]
+                except Exception as exc:
+                    # Never try another collective after a transport failure:
+                    # the async backend must quarantine, not enter its drain ACK.
+                    raise LayerwisePrefillFenceError(
+                        "Layerwise-prefill TP acknowledgement failed; "
+                        "peer device completion is unknown"
+                    ) from exc
+            failures = [
+                (rank, "identity mismatch" if item[0] != identity else None, item[1])
+                for rank, item in enumerate(statuses)
+                if item[0] != identity or item[1] is not None
+            ]
+            if failures:
+                failure_type = (
+                    LayerwisePrefillFenceError
+                    if any(item[2] for item in statuses)
+                    else ValueError
+                )
+                raise failure_type(
+                    f"Layerwise-prefill TP phase failed: {failures!r}"
+                ) from error
+        finally:
+            if buffers is not None:
+                # Keep reusable storage, not the preceding request's contents.
+                buffers[2][:] = bytes(_LAYERWISE_ACK_CAPACITY)
+                for packet in buffers[4]:
+                    packet[:] = bytes(_LAYERWISE_ACK_CAPACITY)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            phase = "other"
+            if type(identity) is tuple and identity:
+                candidate = identity[0]
+                if len(identity) > 1 and (
+                    type(candidate) is not str or candidate not in _LAYERWISE_ACK_PHASES
+                ):
+                    nested = identity[1]
+                    if type(nested) is tuple and nested:
+                        candidate = nested[0]
+                if type(candidate) is str and candidate in _LAYERWISE_ACK_PHASES:
+                    phase = candidate
+            if getattr(self, "_layerwise_prefill_ack_stats", None) is None:
+                self.reset_layerwise_prefill_ack_stats()
+            stats = self._layerwise_prefill_ack_stats
+            if phase not in stats["by_phase"]:
+                stats["by_phase"][phase] = {
+                    key: 0 for key in stats if key != "by_phase"
+                }
+            for values in (stats, stats["by_phase"][phase]):
+                values["count"] += 1
+                values["total_ms"] += elapsed_ms
+                values["max_ms"] = max(values["max_ms"], elapsed_ms)
+                values["serialized_bytes"] += payload_bytes
+                values["max_payload_bytes"] = max(
+                    values["max_payload_bytes"], payload_bytes
+                )
+                values["fast_count"] += fast_count
+                values["slow_count"] += slow_count
 
     def resolve_layerwise_prefill_group(
         self,
