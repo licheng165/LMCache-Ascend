@@ -15,6 +15,7 @@ from vllm.config import SchedulerConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     LayerwisePrefillCallbackMetadata,
 )
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 import pytest
 import torch
@@ -168,13 +169,18 @@ def test_sync_factory_keeps_async_scheduler_default_unaffected(
     assert not engine.gpu_connector.calls
 
 
-@pytest.mark.parametrize("async_scheduling", [None, True, 0])
-def test_async_factory_requires_explicitly_disabled_async_scheduling(
+@pytest.mark.parametrize("async_scheduling", [None, False, True])
+def test_async_factory_accepts_async_scheduling(
     factory_engine: Any, page_runtime: Any, async_scheduling: Any
 ) -> None:
     page_runtime.serving.scheduler_config.async_scheduling = async_scheduling
-    with pytest.raises(ValueError, match="--no-async-scheduling"):
-        _ = factory_engine.layerwise_prefill_window_backend
+    # vLLM defaults async_scheduling to None and auto-enables it when the
+    # executor/speculative configuration is compatible, so all three values
+    # must construct the managed window backend without --no-async-scheduling.
+    assert (
+        type(factory_engine.layerwise_prefill_window_backend)
+        is LayerwisePrefillAsyncBackend
+    )
 
 
 @pytest.mark.parametrize(
@@ -201,14 +207,36 @@ def test_async_factory_requires_serving_config(factory_engine: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "scheduler_cls", [None, Scheduler, "vllm.v1.core.sched.scheduler.Scheduler"]
+    "scheduler_cls",
+    [
+        None,
+        Scheduler,
+        "vllm.v1.core.sched.scheduler.Scheduler",
+        AsyncScheduler,
+        "vllm.v1.core.sched.async_scheduler.AsyncScheduler",
+    ],
 )
 def test_async_factory_accepts_resolved_core_scheduler(
     factory_engine: Any, page_runtime: Any, scheduler_cls: Any
 ) -> None:
     scheduler = page_runtime.serving.scheduler_config
     scheduler.scheduler_cls = scheduler_cls
-    assert scheduler.get_scheduler_cls() is Scheduler
+    assert scheduler.get_scheduler_cls() in (Scheduler, AsyncScheduler)
+    assert (
+        type(factory_engine.layerwise_prefill_window_backend)
+        is LayerwisePrefillAsyncBackend
+    )
+
+
+def test_async_factory_accepts_async_resolution_without_a_configured_class(
+    factory_engine: Any, page_runtime: Any
+) -> None:
+    scheduler = page_runtime.serving.scheduler_config
+    scheduler.scheduler_cls = None
+    scheduler.async_scheduling = True
+    # Production async-scheduling resolution: the lazy import returns the
+    # AsyncScheduler subclass without any scheduler_cls override.
+    assert scheduler.get_scheduler_cls() is AsyncScheduler
     assert (
         type(factory_engine.layerwise_prefill_window_backend)
         is LayerwisePrefillAsyncBackend
@@ -222,14 +250,13 @@ def test_async_factory_rejects_custom_scheduler_class_and_path(
     factory_engine: Any, page_runtime: Any, scheduler_cls: Any
 ) -> None:
     page_runtime.serving.scheduler_config.scheduler_cls = scheduler_cls
-    with pytest.raises(ValueError, match="unpatched synchronous Scheduler"):
+    with pytest.raises(ValueError, match="Recompute/custom scheduling"):
         _ = factory_engine.layerwise_prefill_window_backend
 
 
 @pytest.mark.parametrize(
     "module,name",
     [
-        ("vllm_ascend.patch.platform.patch_balance_schedule", "BalanceScheduler"),
         ("vllm_ascend.core.recompute_scheduler", "RecomputeScheduler"),
         ("custom.scheduler", "Scheduler"),
         ("vllm.v1.core.sched.scheduler", "CustomScheduler"),
@@ -248,8 +275,34 @@ def test_async_factory_checks_actual_scheduler_resolver_not_configured_name(
     # Model Balance-style resolver patches without importing their global patches.
     resolved = Mock(return_value=type(name, (Scheduler,), {"__module__": module}))
     monkeypatch.setattr(scheduler, "get_scheduler_cls", resolved)
-    with pytest.raises(ValueError, match="Balance/Recompute/custom scheduling"):
+    with pytest.raises(ValueError, match="Recompute/custom scheduling"):
         _ = factory_engine.layerwise_prefill_window_backend
+    resolved.assert_called_once_with()
+
+
+@pytest.mark.parametrize("marker", [True, False], ids=["with_marker", "no_marker"])
+def test_async_factory_accepts_only_the_real_balance_patch(
+    factory_engine: Any,
+    page_runtime: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: bool,
+) -> None:
+    scheduler = page_runtime.serving.scheduler_config
+    namespace = {"__module__": "vllm_ascend.patch.platform.patch_balance_schedule"}
+    if marker:
+        namespace["balance_gather"] = lambda self: None
+    # The Ascend balance patch rebinds the module-level Scheduler class; it is
+    # positively identified by module/qualname plus its balance_gather helper.
+    resolved = Mock(return_value=type("BalanceScheduler", (Scheduler,), namespace))
+    monkeypatch.setattr(scheduler, "get_scheduler_cls", resolved)
+    if marker:
+        assert (
+            type(factory_engine.layerwise_prefill_window_backend)
+            is LayerwisePrefillAsyncBackend
+        )
+    else:
+        with pytest.raises(ValueError, match="Recompute/custom scheduling"):
+            _ = factory_engine.layerwise_prefill_window_backend
     resolved.assert_called_once_with()
 
 

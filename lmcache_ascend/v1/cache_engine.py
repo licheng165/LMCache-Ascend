@@ -98,6 +98,40 @@ _LAYERWISE_ACK_PHASES = frozenset(
         "failed_step_drained",
     )
 )
+_LAYERWISE_PREFILL_BALANCE_IDENTITY = (
+    "vllm_ascend.patch.platform.patch_balance_schedule",
+    "BalanceScheduler",
+)
+_LAYERWISE_PREFILL_SCHEDULER_IDENTITIES = frozenset(
+    {
+        ("vllm.v1.core.sched.scheduler", "Scheduler"),
+        ("vllm.v1.core.sched.async_scheduler", "AsyncScheduler"),
+        _LAYERWISE_PREFILL_BALANCE_IDENTITY,
+    }
+)
+
+
+def _allowed_layerwise_prefill_scheduler(scheduler_cls: Any) -> bool:
+    """Accept the core, async and Balance schedulers for the transfer window.
+
+    Async scheduling only pipelines engine-side output consumption. With the
+    required mp/uni executors the worker RPC stream stays strictly serial, so
+    each step's finalize (including finish_step persistence) completes inside
+    its own execute_model/sample_tokens call before the next bind, and the
+    scheduler's optimistically advanced num_computed_tokens equals the
+    committed compute_end. The Balance patch rebinds the module-level
+    Scheduler class and only changes WAITING admission; it is identified by
+    its module/qualname plus the balance_gather helper it uniquely carries.
+    Recompute and arbitrary custom schedulers replace scheduling semantics
+    wholesale and remain rejected.
+    """
+    identity = (
+        getattr(scheduler_cls, "__module__", None),
+        getattr(scheduler_cls, "__qualname__", None),
+    )
+    if identity == _LAYERWISE_PREFILL_BALANCE_IDENTITY:
+        return callable(getattr(scheduler_cls, "balance_gather", None))
+    return identity in _LAYERWISE_PREFILL_SCHEDULER_IDENTITIES
 
 
 def _layerwise_prefill_p_node_enabled() -> bool:
@@ -630,22 +664,19 @@ class AscendLMCacheEngine(LMCacheEngine):
             scheduler = getattr(serving, "scheduler_config", None)
             if (
                 not mooncake_page_layout_enabled(config)
-                or getattr(scheduler, "async_scheduling", None) is not False
                 or getattr(parallel, "distributed_executor_backend", None)
                 not in ("mp", "uni")
             ):
                 raise ValueError(
-                    "Layerwise-prefill transfer window requires page-first, "
-                    "--no-async-scheduling and the mp/uni executor"
+                    "Layerwise-prefill transfer window requires page-first "
+                    "storage and the mp/uni executor"
                 )
             scheduler_cls = scheduler.get_scheduler_cls()
-            if (
-                scheduler_cls.__module__ != "vllm.v1.core.sched.scheduler"
-                or scheduler_cls.__qualname__ != "Scheduler"
-            ):
+            if not _allowed_layerwise_prefill_scheduler(scheduler_cls):
                 raise ValueError(
-                    "Layerwise-prefill transfer window requires the unpatched "
-                    "synchronous Scheduler; disable Balance/Recompute/custom scheduling"
+                    "Layerwise-prefill transfer window accepts only the core "
+                    "Scheduler, AsyncScheduler and the Ascend "
+                    "BalanceScheduler; disable Recompute/custom scheduling"
                 )
             if (
                 getattr(

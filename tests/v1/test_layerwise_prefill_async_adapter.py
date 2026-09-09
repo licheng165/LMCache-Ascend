@@ -27,6 +27,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
 from lmcache.observability import LMCStatsMonitor
 from lmcache.v1.memory_management import TensorMemoryAllocator
 from vllm.config import SchedulerConfig
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 import pytest
 import torch
@@ -59,7 +60,9 @@ def async_adapter(page_runtime: Any, monkeypatch: Any) -> Any:
     return _make_async_adapter(page_runtime, monkeypatch)
 
 
-def _make_async_adapter(page_runtime: Any, monkeypatch: Any) -> Any:
+def _make_async_adapter(
+    page_runtime: Any, monkeypatch: Any, *, async_scheduling: bool = False
+) -> Any:
     adapter = _make_adapter(page_runtime, monkeypatch)
     # The bookkeeping helper stubs telemetry. Cold remote reads must see no
     # active retrieve span, rather than a Mock-valued detailed-metrics mapping.
@@ -70,10 +73,12 @@ def _make_async_adapter(page_runtime: Any, monkeypatch: Any) -> Any:
     engine.config.extra_config["layerwise_prefill_transfer_window"] = True
     engine.gpu_connector = DeferredCPUConnector()
     page_runtime.serving.scheduler_config = SchedulerConfig.default_factory(
-        async_scheduling=False
+        async_scheduling=async_scheduling
     )
     assert page_runtime.serving.scheduler_config.scheduler_cls is None
-    assert page_runtime.serving.scheduler_config.get_scheduler_cls() is Scheduler
+    assert page_runtime.serving.scheduler_config.get_scheduler_cls() is (
+        AsyncScheduler if async_scheduling else Scheduler
+    )
     page_runtime.serving.parallel_config.distributed_executor_backend = "mp"
     engine.configure_layerwise_prefill_sync(None)
     engine.is_store_async = False
@@ -188,6 +193,58 @@ def test_adapter_101_rows_do_not_wait_assembly_at_eight_jobs(
         req.request_id: 512 for req in requests
     }
     adapter.get_finished({req.request_id for req in requests})
+
+
+def test_adapter_full_two_chunk_flow_with_async_scheduling_resolution(
+    page_runtime: Any, monkeypatch: Any
+) -> None:
+    # Async scheduling only pipelines engine-side output consumption; the
+    # worker-side flow (bind, rows, finish_step, persistence) must be
+    # unaffected when the resolver hands back AsyncScheduler.
+    adapter = _make_async_adapter(page_runtime, monkeypatch, async_scheduling=True)
+    engine, window = adapter.lmcache_engine, adapter._layerwise_prefill_window
+    requests = [_request()]
+    for start, end in ((0, 300), (300, 530)):
+        if start:
+            requests = [
+                replace(
+                    requests[0],
+                    compute_start=start,
+                    restore_end=start,
+                    compute_end=end,
+                    allocation_generation=2,
+                )
+            ]
+        callbacks = _start(adapter, requests, final=bool(start))
+        before = len(page_runtime.store.puts)
+        for execution in range(79):
+            current = [m for m in callbacks if m.row.execution_ordinal == execution]
+            for metadata in current:
+                adapter.wait_for_layerwise_prefill_load(metadata)
+            for metadata in current:
+                _compute(engine, requests, metadata)
+                adapter.submit_layerwise_prefill_save(
+                    metadata, adapter.kv_caches[metadata.row.layer_name]
+                )
+            adapter.submit_layerwise_prefill_load(current[0])
+            for metadata in current:
+                adapter.finish_layerwise_prefill_save(metadata)
+            assert (
+                window.pending_jobs()
+                == window.pending_bytes()
+                == window.pending_futures()
+                == 0
+            )
+        assert len(page_runtime.store.puts) == before
+        adapter.wait_for_save()
+        assert all(
+            adapter.layerwise_prefill_request_persist_done(req.request_id)
+            for req in requests
+        )
+        for req in requests:
+            _assert_remote(engine, req, page_runtime.store)
+    assert adapter.get_completed_decode_window_saves() == {requests[0].request_id: 512}
+    adapter.get_finished({requests[0].request_id})
 
 
 @pytest.mark.parametrize("phase", ["save", "load", "finish"])
