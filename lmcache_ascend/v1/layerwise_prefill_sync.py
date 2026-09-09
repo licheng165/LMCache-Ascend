@@ -9,7 +9,7 @@ TP ranks. Page-first remote persistence completes only at the final step barrier
 # Standard
 from concurrent.futures import Future
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -45,6 +45,16 @@ class _RowPrefix:
     objects: list[MemoryObj]
     revision: int
     slab_generation: int
+    # Typed CPU views aligned 1:1 with ``objects``, acquired once when the
+    # manifest is built or extended. The manifest owns the pinned MemoryObjs
+    # and shm leases, so cached views stay valid until the manifest is
+    # replaced at the next commit; they are never rebuilt per step.
+    views: list = field(default_factory=list)
+
+
+def _row_views(objects: list[MemoryObj]) -> list:
+    """Acquire typed CPU views once per chunk; ownership stays with objects."""
+    return [obj.tensor for obj in objects]
 
 
 class LayerwisePrefillSyncBackend:
@@ -366,6 +376,7 @@ class LayerwisePrefillSyncBackend:
             identity = (req.request_id, req.allocation_generation, group, row)
             prior = self._prefixes.get(identity)
             objects = prior.objects if prior is not None else None
+            views = prior.views if prior is not None else []
             error = None
             try:
                 if prior is None:
@@ -399,11 +410,22 @@ class LayerwisePrefillSyncBackend:
                         error=error,
                     )
                     self._published_handles += len(keys)
+                    views = _row_views(objects)
                 else:
                     starts, ends, keys = prior.starts, prior.ends, prior.keys
                     self._reused_rows += 1
                 if objects:
-                    self._transfer(req, name, group, bank, objects, starts, ends, False)
+                    self._transfer(
+                        req,
+                        name,
+                        group,
+                        bank,
+                        objects,
+                        starts,
+                        ends,
+                        False,
+                        tensors=views,
+                    )
             except Exception as exc:
                 error = exc
             try:
@@ -421,6 +443,7 @@ class LayerwisePrefillSyncBackend:
                     ends,
                     keys,
                     objects,
+                    views=views,
                     revision=self._step,
                     slab_generation=self._engine.shared_cpu_cache_generation,
                 )
@@ -527,6 +550,7 @@ class LayerwisePrefillSyncBackend:
                 ends,
                 keys,
                 prior.objects[:keep] + objects,
+                views=prior.views[:keep] + _row_views(objects),
                 revision=self._step,
                 slab_generation=self._engine.shared_cpu_cache_generation,
             )
@@ -895,12 +919,17 @@ class LayerwisePrefillSyncBackend:
         starts: list[int],
         ends: list[int],
         direction: bool,
+        tensors: list | None = None,
     ) -> None:
         connector = self._engine.gpu_connector
         try:
             connector.transfer_layerwise_prefill_row(
                 self._caches[name],
-                [obj.tensor for obj in objects],
+                (
+                    [obj.tensor for obj in objects]
+                    if tensors is None
+                    else tensors
+                ),
                 starts,
                 ends,
                 self._slots[req.request_id, bank, group],

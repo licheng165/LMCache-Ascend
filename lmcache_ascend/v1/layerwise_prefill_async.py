@@ -29,6 +29,7 @@ from lmcache_ascend.v1.layerwise_prefill_sync import (
     LayerwisePrefillFenceError,
     LayerwisePrefillSyncBackend,
     _RowPrefix,
+    _row_views,
 )
 
 
@@ -625,6 +626,9 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 source.prior.objects[:keep] + objects,
                 self._step,
                 self._engine.shared_cpu_cache_generation,
+                # Retained chunk views are reused verbatim; only the committed
+                # suffix acquires fresh typed views.
+                source.prior.views[:keep] + _row_views(objects),
             )
             source.fresh = []  # Ownership moved into the committed manifest.
             self._published_handles += len(objects)
@@ -859,6 +863,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                         extent != req.restore_end
                         or count != (extent + 255) // 256
                         or not len(starts) == len(ends) == len(keys) == count
+                        or len(prior.views) != len(prior.objects)
                         or prior.slab_generation
                         != self._engine.shared_cpu_cache_generation
                         or not 0 < prior.revision <= self._step
@@ -909,13 +914,22 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                         objects,
                         self._step,
                         self._engine.shared_cpu_cache_generation,
+                        _row_views(objects),
                     )
                     self._prefixes[identity] = prior
                     self._published_handles += len(keys)
                 else:
                     self._reused_rows += 1
                 record.loads.append(
-                    self._prepare_ticket(req, key, prior.objects, starts, ends, False)
+                    self._prepare_ticket(
+                        req,
+                        key,
+                        prior.objects,
+                        starts,
+                        ends,
+                        False,
+                        tensors=prior.views,
+                    )
                 )
             except Exception as exc:
                 error = error or exc
@@ -985,12 +999,17 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         starts: list,
         ends: list,
         direction: bool,
+        tensors: list | None = None,
     ) -> Any:
         started = perf_counter() if not direction else None
         try:
             return self._engine.gpu_connector.prepare_layerwise_prefill_row(
                 self._caches[key[0]],
-                [obj.tensor for obj in objects],
+                (
+                    [obj.tensor for obj in objects]
+                    if tensors is None
+                    else tensors
+                ),
                 starts,
                 ends,
                 self._slots[req.request_id, key[4], key[2]],
