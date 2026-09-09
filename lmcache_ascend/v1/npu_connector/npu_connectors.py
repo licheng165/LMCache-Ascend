@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+from threading import get_ident
 from time import perf_counter
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
 
@@ -1483,6 +1484,82 @@ class _PreparedLayerwisePrefillSlots:
     _length: int
 
 
+@dataclass(frozen=True, eq=False)
+class _PreparedLayerwisePrefillRow:
+    """Opaque, single-submit row and ticket. Only done_event is public.
+
+    Payload contents may be produced after preparation (notably post-SFA KV).
+    Their storage/geometry must not change, and metadata must never be written.
+    Lifecycle fields are changed only by the owning connector's control thread.
+    """
+
+    _owner: Any
+    _kv_group: int
+    _layout: Any
+    _layout_values: tuple
+    _device: Any
+    _stream: Any
+    _direction: bool
+    _done_event: Any
+    _args: tuple = ()
+    _owners: tuple = ()
+    _tensor_identities: tuple = ()
+    _metadata_versions: tuple = ()
+    _wait_event: Any = None
+    _state: str = "prepared"
+    _recorded: bool = False
+    _error: Optional[BaseException] = None
+    _identity: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_identity", id(self))
+
+    @property
+    def done_event(self) -> Any:
+        """Completion dependency, valid after successful submit, even after complete."""
+        if (
+            not self._recorded
+            or self._state not in ("submitted", "complete")
+            or self._error is not None
+        ):
+            raise ValueError(
+                "Prefill row completion event requires successful submission"
+            )
+        return self._done_event
+
+
+def _prefill_row_layout_values(layout: _GroupLayout) -> tuple:
+    # No global cache traversal or per-token work on the submit path.
+    return (
+        layout.kv_format,
+        layout.k_hidden_dims,
+        layout.v_hidden_dims,
+        layout.dsa_hidden_dims,
+        layout.kv_lora_rank,
+        layout.qk_rope_head_dim,
+        layout.dsa_head_dim,
+        layout.vllm_two_major,
+        layout.kv_device,
+        layout.num_layers,
+        layout.layer_indices,
+        layout.layout_signature,
+        layout.topology_signature,
+    )
+
+
+def _prefill_row_tensor_identity(tensor: torch.Tensor) -> tuple:
+    # Payload versions are deliberately excluded: SFA can write KV after prepare,
+    # and inference tensors have no version counter. No data is copied or read.
+    return (
+        tensor.data_ptr(),
+        tensor.shape,
+        tensor.stride(),
+        tensor.dtype,
+        tensor.device,
+        tensor.untyped_storage().nbytes(),
+    )
+
+
 class _SparseDestinationPlan:
     """Process-owned native states for one paged-KV destination group."""
 
@@ -1512,6 +1589,7 @@ class _SparseLoadJoin:
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
     supports_layer_page_source = True
     supports_layerwise_prefill_transfer_timings = True
+    supports_layerwise_prefill_async_rows = True
 
     def __init__(
         self,
@@ -1585,6 +1663,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             int, tuple[tuple, list[tuple[int, int]]]
         ] = {}
         self._layerwise_prefill_row_failed_owners: Optional[list[Any]] = None
+        self._layerwise_prefill_inflight: dict[int, _PreparedLayerwisePrefillRow] = {}
 
     def prepare_layerwise_prefill_slots(
         self,
@@ -1656,7 +1735,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             len(slot_values),
         )
 
-    def transfer_layerwise_prefill_row(
+    def _validate_layerwise_prefill_row(
         self,
         kv_layer: Sequence[torch.Tensor],
         cpu_chunks: Sequence[torch.Tensor],
@@ -1667,32 +1746,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: int,
         direction: bool,
         slot_mapping_base: int = 0,
-        timing: Optional[dict[str, float]] = None,
-    ) -> None:
-        """Synchronously transfer one actual MLA/DSA row, without KV staging.
-
-        ``direction=True`` stores NPU -> CPU; ``False`` loads CPU -> NPU.
-        The full group's layout must already be registered. ``kv_layer`` is
-        the actual tuple/list of contiguous BF16 PA-BSND planes, not a layer
-        ordinal or a singleton group. Each registered local CPU tensor contains
-        exactly ``end - start`` tokens, packed as stacked planes (including
-        short tails). Ranges index ``slot_mapping`` relative to its absolute
-        ``slot_mapping_base``; gaps are allowed and H2D slots must be unique.
-        A plan from ``prepare_layerwise_prefill_slots`` reuses validated NPU
-        slots without packing or readback when the supplied ranges are consecutive.
-        Empty chunks/starts/ends are an explicit no-op.
-
-        Optional ``timing`` accumulates host seconds in ``prepare_s`` (validation,
-        packing, registration and metadata), ``submit_s`` (native wrapper) and
-        ``fence_s`` (completion fence), without extra synchronization or logging.
-
-        Owners and metadata survive the completion fence, even if launch fails.
-        A failed fence retains them on the connector and disables this hook:
-        callers must not publish/recycle their banks after such an error.
-        """
+    ) -> Optional[tuple]:
+        """Shared synchronous/asynchronous geometry and range validation."""
         if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
             raise RuntimeError("A previous prefill row completion fence failed")
-        prepare_start = perf_counter() if timing is not None else 0.0
         if type(kv_group) is not int or kv_group < 0:
             raise ValueError("kv_group must be a non-negative integer")
         if type(direction) is not bool:
@@ -1845,6 +1902,150 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         transfer_stream = self.store_stream if direction else self.load_stream
         if transfer_stream.device != device:
             raise ValueError("Prefill row transfer stream must be on the KV NPU device")
+        return (
+            layout,
+            planes,
+            chunks,
+            mapping,
+            prepared,
+            capacity,
+            ranges,
+            consecutive,
+            offsets,
+            sizes,
+            total_tokens,
+            transfer_stream,
+        )
+
+    def _prepare_layerwise_prefill_row_metadata(
+        self,
+        validated: tuple,
+        direction: bool,
+        owners: list,
+        *,
+        snapshot: bool = False,
+    ) -> tuple:
+        (
+            layout,
+            planes,
+            chunks,
+            mapping,
+            prepared,
+            capacity,
+            ranges,
+            consecutive,
+            offsets,
+            sizes,
+            total_tokens,
+            _,
+        ) = validated
+        device = layout.kv_device
+        slots = (
+            mapping[ranges[0][0] : ranges[-1][1]]
+            if consecutive
+            else torch.cat([mapping[s:e] for s, e in ranges])
+        )
+        owners.append(slots)
+        if prepared is not None and consecutive:
+            slots_npu = slots
+        else:
+            if snapshot:
+                slots = slots.detach().to(device="cpu", dtype=torch.int64).clone()
+                owners.append(slots)
+            slot_values = slots.detach().to(device="cpu").tolist()
+            if any(slot < 0 or slot >= capacity for slot in slot_values):
+                raise ValueError("Prefill row slot is out of KV capacity")
+            if not direction and len(set(slot_values)) != total_tokens:
+                raise ValueError(
+                    "Prefill row H2D slot_mapping contains duplicate slots"
+                )
+            slots_npu = slots.to(device=device, dtype=torch.int64).contiguous()
+        owners.append(slots_npu)
+        pointers = [
+            self._resolve_registered_cpu_source_device_ptr(
+                chunk,
+                layer_id=-1,
+                chunk_index=index,
+                source="transfer_layerwise_prefill_row",
+            )
+            for index, chunk in enumerate(chunks)
+        ]
+        if any(ptr <= 0 for ptr in pointers):
+            raise RuntimeError("Prefill row CPU registered pointer must be positive")
+        pointers_npu = torch.tensor(pointers, dtype=torch.int64, device=device)
+        owners.append(pointers_npu)
+        offsets_npu = torch.tensor(offsets, dtype=torch.int32, device=device)
+        owners.append(offsets_npu)
+        sizes_npu = torch.tensor(sizes, dtype=torch.int32, device=device)
+        owners.append(sizes_npu)
+        return (
+            chunks,
+            planes,
+            slots_npu,
+            offsets_npu,
+            sizes_npu,
+            total_tokens,
+            layout.kv_format.value,
+            False,
+            False,
+            layout.k_hidden_dims,
+            layout.v_hidden_dims,
+            layout.dsa_hidden_dims,
+            False,
+            direction,
+            pointers_npu,
+            0,
+        )
+
+    def transfer_layerwise_prefill_row(
+        self,
+        kv_layer: Sequence[torch.Tensor],
+        cpu_chunks: Sequence[torch.Tensor],
+        starts: Sequence[int],
+        ends: Sequence[int],
+        slot_mapping: Union[torch.Tensor, _PreparedLayerwisePrefillSlots],
+        *,
+        kv_group: int,
+        direction: bool,
+        slot_mapping_base: int = 0,
+        timing: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Synchronously transfer one actual MLA/DSA row, without KV staging.
+
+        ``direction=True`` stores NPU -> CPU; ``False`` loads CPU -> NPU.
+        The full group's layout must already be registered. ``kv_layer`` is
+        the actual tuple/list of contiguous BF16 PA-BSND planes, not a layer
+        ordinal or a singleton group. Each registered local CPU tensor contains
+        exactly ``end - start`` tokens, packed as stacked planes (including
+        short tails). Ranges index ``slot_mapping`` relative to its absolute
+        ``slot_mapping_base``; gaps are allowed and H2D slots must be unique.
+        A plan from ``prepare_layerwise_prefill_slots`` reuses validated NPU
+        slots without packing or readback when the supplied ranges are consecutive.
+        Empty chunks/starts/ends are an explicit no-op.
+
+        Optional ``timing`` accumulates host seconds in ``prepare_s`` (validation,
+        packing, registration and metadata), ``submit_s`` (native wrapper) and
+        ``fence_s`` (completion fence), without extra synchronization or logging.
+
+        Owners and metadata survive the completion fence, even if launch fails.
+        A failed fence retains them on the connector and disables this hook:
+        callers must not publish/recycle their banks after such an error.
+        """
+        prepare_start = perf_counter() if timing is not None else 0.0
+        validated = self._validate_layerwise_prefill_row(
+            kv_layer,
+            cpu_chunks,
+            starts,
+            ends,
+            slot_mapping,
+            kv_group=kv_group,
+            direction=direction,
+            slot_mapping_base=slot_mapping_base,
+        )
+        if validated is None:
+            return
+        layout, planes, chunks = validated[:3]
+        device, transfer_stream = layout.kv_device, validated[-1]
         # Native commands retain raw pointers, not these Python tensor owners.
         owners: list[Any] = [planes, chunks, slot_mapping]
         submit_start = None
@@ -1853,69 +2054,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             try:
                 with torch.npu.stream(transfer_stream):
                     transfer_stream.wait_stream(compute_stream)
-                    slots = (
-                        mapping[ranges[0][0] : ranges[-1][1]]
-                        if consecutive
-                        else torch.cat([mapping[s:e] for s, e in ranges])
+                    args = self._prepare_layerwise_prefill_row_metadata(
+                        validated, direction, owners
                     )
-                    owners.append(slots)
-                    if prepared is not None and consecutive:
-                        slots_npu = slots
-                    else:
-                        slot_values = slots.detach().to(device="cpu").tolist()
-                        if any(slot < 0 or slot >= capacity for slot in slot_values):
-                            raise ValueError("Prefill row slot is out of KV capacity")
-                        if not direction and len(set(slot_values)) != total_tokens:
-                            raise ValueError(
-                                "Prefill row H2D slot_mapping contains duplicate slots"
-                            )
-                        slots_npu = slots.to(
-                            device=device, dtype=torch.int64
-                        ).contiguous()
-                    owners.append(slots_npu)
-                    pointers = [
-                        self._resolve_registered_cpu_source_device_ptr(
-                            chunk,
-                            layer_id=-1,
-                            chunk_index=index,
-                            source="transfer_layerwise_prefill_row",
-                        )
-                        for index, chunk in enumerate(chunks)
-                    ]
-                    if any(ptr <= 0 for ptr in pointers):
-                        raise RuntimeError(
-                            "Prefill row CPU registered pointer must be positive"
-                        )
-                    pointers_npu = torch.tensor(
-                        pointers, dtype=torch.int64, device=device
-                    )
-                    owners.append(pointers_npu)
-                    offsets_npu = torch.tensor(
-                        offsets, dtype=torch.int32, device=device
-                    )
-                    owners.append(offsets_npu)
-                    sizes_npu = torch.tensor(sizes, dtype=torch.int32, device=device)
-                    owners.append(sizes_npu)
                     if timing is not None:
                         submit_start = perf_counter()
-                    dense_mla_dsa_batched_direct_kv_transfer(
-                        chunks,
-                        planes,
-                        slots_npu,
-                        offsets_npu,
-                        sizes_npu,
-                        total_tokens,
-                        kvcache_format_raw=layout.kv_format.value,
-                        token_major=False,
-                        vllm_two_major=False,
-                        k_hidden_dims=layout.k_hidden_dims,
-                        v_hidden_dims=layout.v_hidden_dims,
-                        dsa_hidden_dims=layout.dsa_hidden_dims,
-                        lmc_host_interleaved=False,
-                        direction=direction,
-                        chunk_ptrs_npu=pointers_npu,
-                        fixed_chunk_size=0,
-                    )
+                    dense_mla_dsa_batched_direct_kv_transfer(*args)
             finally:
                 if timing is not None:
                     fence_start = perf_counter()
@@ -1936,6 +2080,290 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         timing["fence_s"] = (
                             timing.get("fence_s", 0.0) + perf_counter() - fence_start
                         )
+
+    def _check_layerwise_prefill_thread(self) -> None:
+        thread = get_ident()
+        owner_thread = getattr(self, "_layerwise_prefill_thread", None)
+        if owner_thread is None:
+            self._layerwise_prefill_thread = thread
+        elif owner_thread != thread:
+            raise RuntimeError("Prefill row hooks require the model/control thread")
+
+    def prepare_layerwise_prefill_row(
+        self,
+        kv_layer: Sequence[torch.Tensor],
+        cpu_chunks: Sequence[torch.Tensor],
+        starts: Sequence[int],
+        ends: Sequence[int],
+        slot_mapping: Union[torch.Tensor, _PreparedLayerwisePrefillSlots],
+        *,
+        kv_group: int,
+        direction: bool,
+        slot_mapping_base: int = 0,
+    ) -> _PreparedLayerwisePrefillRow:
+        """Prepare a single-submit asynchronous row outside the pre-HCOM region.
+
+        Geometry, direction and packing match transfer_layerwise_prefill_row.
+        All allocations, registration lookups and slot validation happen here.
+        Metadata is queued on the selected transfer stream after the current
+        compute stream (including prepared slot uploads); submit uses that same
+        transfer stream and adds a fresh post-SFA compute dependency.
+
+        Call all async hooks on one model/control thread, never a storage worker.
+        Keep CPU allocations registered and do not recycle/write payload storage
+        until completion. Preparation snapshots metadata, not KV payload contents.
+        Empty chunks/ranges produce an event-only ticket, even without a layout.
+        """
+        self._check_layerwise_prefill_thread()
+        validated = self._validate_layerwise_prefill_row(
+            kv_layer,
+            cpu_chunks,
+            starts,
+            ends,
+            slot_mapping,
+            kv_group=kv_group,
+            direction=direction,
+            slot_mapping_base=slot_mapping_base,
+        )
+        if not hasattr(self, "_layerwise_prefill_inflight"):
+            self._layerwise_prefill_inflight = {}
+        stream = self.store_stream if direction else self.load_stream
+        layout = validated[0] if validated is not None else None
+        device = layout.kv_device if layout is not None else stream.device
+        owners: list[Any] = []
+        if validated is not None:
+            owners.extend((validated[1], validated[2], slot_mapping))
+        with torch.inference_mode(False), torch.npu.device(device):
+            compute = torch.npu.current_stream(device)
+            try:
+                with torch.npu.stream(stream):
+                    stream.wait_stream(compute)
+                    args = (
+                        self._prepare_layerwise_prefill_row_metadata(
+                            validated, direction, owners, snapshot=True
+                        )
+                        if validated is not None
+                        else ()
+                    )
+                    done = torch.npu.Event()
+                    # NPU events allocate their native handle lazily on first
+                    # record. Materialize it here, then re-record at submit.
+                    done.record(stream)
+                    metadata = (args[2], args[3], args[4], args[14]) if args else ()
+                    if (
+                        isinstance(slot_mapping, _PreparedLayerwisePrefillSlots)
+                        and args
+                    ):
+                        metadata += (slot_mapping._slots,)
+                    return _PreparedLayerwisePrefillRow(
+                        self,
+                        kv_group,
+                        layout,
+                        _prefill_row_layout_values(layout)
+                        if layout is not None
+                        else (),
+                        device,
+                        stream,
+                        direction,
+                        done,
+                        _args=args,
+                        _owners=tuple(owners),
+                        _tensor_identities=tuple(
+                            (tensor, _prefill_row_tensor_identity(tensor))
+                            for tensor in (
+                                (*args[0], *args[1], *metadata) if args else ()
+                            )
+                        ),
+                        _metadata_versions=tuple((t, t._version) for t in metadata),
+                    )
+            except BaseException:
+                # Preparation can have queued metadata copies before failing.
+                # This is outside pre-HCOM, so it is safe to fence here.
+                try:
+                    stream.synchronize()
+                except BaseException:
+                    self._layerwise_prefill_row_failed_owners = owners
+                    self._layerwise_prefill_prepare_failed_stream = stream
+                    raise
+                raise
+
+    def _check_layerwise_prefill_ticket(
+        self, ticket: _PreparedLayerwisePrefillRow
+    ) -> None:
+        self._check_layerwise_prefill_thread()
+        if (
+            type(ticket) is not _PreparedLayerwisePrefillRow
+            or ticket._owner is not self
+            or ticket._identity != id(ticket)
+        ):
+            raise ValueError(
+                "Prefill row ticket belongs to another connector or is copied"
+            )
+
+    def submit_layerwise_prefill_row(
+        self,
+        prepared: _PreparedLayerwisePrefillRow,
+        *,
+        wait_event: Any = None,
+    ) -> _PreparedLayerwisePrefillRow:
+        """Enqueue only: post-SFA compute wait, optional bank wait, launch, event.
+
+        Returns the prepared object as its stateful ticket. On any enqueue error,
+        owners remain registered even though this method raises; defer handling
+        until post-HCOM and call drain_layerwise_prefill_transfers.
+        """
+        self._check_layerwise_prefill_ticket(prepared)
+        if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
+            raise RuntimeError("A previous prefill row completion fence failed")
+        if prepared._state != "prepared":
+            raise ValueError("Prefill prepared row has already been submitted")
+        layout = prepared._layout
+        if layout is not None and (
+            self._group_layouts.get(prepared._kv_group) is not layout
+            or _prefill_row_layout_values(layout) != prepared._layout_values
+            or self.dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "Prefill prepared row group/layout was mutated or replaced"
+            )
+        stream = self.store_stream if prepared._direction else self.load_stream
+        if stream is not prepared._stream or stream.device != prepared._device:
+            raise ValueError("Prefill prepared row transfer stream/device was replaced")
+        for tensor, identity in prepared._tensor_identities:
+            if _prefill_row_tensor_identity(tensor) != identity:
+                raise ValueError(
+                    "Prefill prepared row tensor storage/geometry was mutated"
+                )
+        for tensor, version in prepared._metadata_versions:
+            if tensor._version != version:
+                raise ValueError("Prefill prepared row metadata was mutated")
+
+        # Register BEFORE even a wait can enqueue. In particular, a native
+        # command or event.record can throw after only part of its work queued.
+        object.__setattr__(prepared, "_wait_event", wait_event)
+        self._layerwise_prefill_inflight[id(prepared)] = prepared
+        object.__setattr__(prepared, "_state", "submitted")
+        try:
+            with torch.npu.device(prepared._device):
+                compute = torch.npu.current_stream(prepared._device)
+                with torch.npu.stream(stream):
+                    stream.wait_stream(compute)
+                    if wait_event is not None:
+                        stream.wait_event(wait_event)
+                    if prepared._args:
+                        lmc_ops.dense_mla_dsa_batched_direct_kv_transfer(
+                            *prepared._args
+                        )
+                    prepared._done_event.record(stream)
+                    object.__setattr__(prepared, "_recorded", True)
+        except BaseException as error:
+            object.__setattr__(prepared, "_error", error)
+            raise
+        return prepared
+
+    def wait_layerwise_prefill_row(self, ticket: _PreparedLayerwisePrefillRow) -> None:
+        """Order the current compute consumer after the row; no host fence/release."""
+        self._check_layerwise_prefill_ticket(ticket)
+        if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
+            raise RuntimeError("A previous prefill row completion fence failed")
+        if ticket._state not in ("submitted", "complete") or not ticket._recorded:
+            raise ValueError("Prefill row has no successful submission to wait for")
+        if ticket._error is not None:
+            raise RuntimeError("Prefill row submission failed; drain before recycling")
+        with torch.npu.device(ticket._device):
+            torch.npu.current_stream(ticket._device).wait_event(ticket.done_event)
+
+    def _finish_layerwise_prefill_row(
+        self,
+        ticket: _PreparedLayerwisePrefillRow,
+        *,
+        drain: bool,
+    ) -> None:
+        error = ticket._error
+        try:
+            with torch.npu.device(ticket._device):
+                if drain and not ticket._recorded:
+                    # The preallocated event may still mark preparation only.
+                    # Never use that stale event to fence a partial submission.
+                    ticket._stream.synchronize()
+                else:
+                    if not ticket._recorded:
+                        ticket._done_event.record(ticket._stream)
+                        object.__setattr__(ticket, "_recorded", True)
+                    ticket._done_event.synchronize()
+        except BaseException as fence_error:
+            if getattr(self, "_layerwise_prefill_row_failed_owners", None) is None:
+                self._layerwise_prefill_row_failed_owners = []
+            # Inflight remains the owner quarantine. A later successful drain
+            # may release it, but never unpoisons this connector.
+            if error is not None:
+                raise error from fence_error
+            raise
+        del self._layerwise_prefill_inflight[id(ticket)]
+        object.__setattr__(
+            ticket, "_state", "failed" if error is not None else "complete"
+        )
+        for name in (
+            "_args",
+            "_owners",
+            "_tensor_identities",
+            "_metadata_versions",
+            "_layout_values",
+        ):
+            object.__setattr__(ticket, name, ())
+        object.__setattr__(ticket, "_layout", None)
+        object.__setattr__(ticket, "_wait_event", None)
+        object.__setattr__(ticket, "_error", None)
+        if error is not None:
+            raise error.with_traceback(None)
+
+    def complete_layerwise_prefill_row(
+        self, ticket: _PreparedLayerwisePrefillRow
+    ) -> None:
+        """Host-fence this row's event, then release payload/metadata owners.
+
+        Successful completion is idempotent and done_event stays usable. A
+        partial launch error is re-raised after fencing; a failed fence poisons
+        the connector and retains owners. Never call in pre-HCOM.
+        """
+        self._check_layerwise_prefill_ticket(ticket)
+        if ticket._state == "complete":
+            return
+        if ticket._state != "submitted":
+            raise ValueError("Prefill row is not pending successful completion")
+        self._finish_layerwise_prefill_row(ticket, drain=False)
+
+    def drain_layerwise_prefill_transfers(self) -> None:
+        """Fence every pending row, including event-missing partial submissions.
+
+        Always attempts all rows before raising the first error. Unknown fences
+        quarantine their owners and permanently disable new rows. Control-thread
+        error cleanup only, never a storage-executor or pre-HCOM operation.
+        """
+        self._check_layerwise_prefill_thread()
+        first_error = None
+        for ticket in tuple(getattr(self, "_layerwise_prefill_inflight", {}).values()):
+            try:
+                self._check_layerwise_prefill_ticket(ticket)
+                self._finish_layerwise_prefill_row(ticket, drain=True)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        prepare_stream = getattr(self, "_layerwise_prefill_prepare_failed_stream", None)
+        if prepare_stream is not None:
+            try:
+                with torch.npu.device(prepare_stream.device):
+                    prepare_stream.synchronize()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                self._layerwise_prefill_prepare_failed_stream = None
+                self._layerwise_prefill_row_failed_owners = []
+        if first_error is not None:
+            raise first_error
+        if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
+            raise RuntimeError("A previous prefill row completion fence failed")
 
     def supports_dense_sparse_cache_retention(self) -> bool:
         return not _DENSE_DIRECT_LOAD_DISABLE

@@ -42,18 +42,54 @@ class _Stream:
         self.env = env
         self.name = name
         self.device = _DEVICE
+        self.queue = []
+        self.completed = 0
+
+    def run_to(self, mark):
+        while self.completed < mark:
+            operation = self.queue[self.completed]
+            operation()
+            self.queue[self.completed] = None
+            self.completed += 1
 
     def wait_stream(self, producer):
         assert self.env.active is self
         self.env.events.append((self.name, "wait", producer.name))
+        mark = len(producer.queue)
+        self.queue.append(lambda: producer.run_to(mark))
+
+    def wait_event(self, event):
+        assert self.env.active is self or self is self.env.compute
+        assert event.stream is not None
+        self.env.events.append((self.name, "wait_event", event))
+        stream, mark = event.stream, event.mark
+        self.queue.append(lambda: stream.run_to(mark))
 
     def synchronize(self):
         self.env.events.append((self.name, "sync"))
         if self.env.sync_error:
             raise RuntimeError("completion failed")
-        for operation in self.env.pending:
-            operation()
-        self.env.pending.clear()
+        self.run_to(len(self.queue))
+
+
+class _Event:
+    def __init__(self, env):
+        self.env = env
+        self.stream = None
+        self.mark = None
+        env.events.append(("event", "allocate", self))
+
+    def record(self, stream):
+        self.env.events.append((stream.name, "record", self))
+        if self.env.event_record_error:
+            raise RuntimeError("event record failed")
+        self.stream, self.mark = stream, len(stream.queue)
+
+    def synchronize(self):
+        self.env.events.append((self.stream.name, "event_sync", self))
+        if self.env.sync_error or self.env.event_sync_error:
+            raise RuntimeError("event completion failed")
+        self.stream.run_to(self.mark)
 
 
 @pytest.fixture
@@ -65,6 +101,8 @@ def row_env(monkeypatch):
         active=None,
         launch_error=False,
         sync_error=False,
+        event_record_error=False,
+        event_sync_error=False,
         pointer_error=None,
         host_ops=dict(
             cat=0,
@@ -104,6 +142,7 @@ def row_env(monkeypatch):
     monkeypatch.setattr(torch.npu, "stream", stream_context)
     monkeypatch.setattr(torch.npu, "device", device_context)
     monkeypatch.setattr(torch.npu, "current_stream", current_stream)
+    monkeypatch.setattr(torch.npu, "Event", lambda: _Event(env))
     tensor_factory, tensor_to, tensor_cat = torch.tensor, torch.Tensor.to, torch.cat
     tensor_tolist, tensor_getitem = torch.Tensor.tolist, torch.Tensor.__getitem__
 
@@ -225,7 +264,9 @@ def row_env(monkeypatch):
         env.last_refs = plane_refs + chunk_refs + metadata_refs
 
         def complete():
-            assert all(ref() is not None for ref in env.last_refs)
+            assert all(
+                ref() is not None for ref in plane_refs + chunk_refs + metadata_refs
+            )
             slot_values = tensor_tolist(metadata_refs[0]().as_subclass(torch.Tensor))
             offset_values = tensor_tolist(metadata_refs[1]())
             size_values = tensor_tolist(metadata_refs[2]())
@@ -246,8 +287,10 @@ def row_env(monkeypatch):
                         else:
                             plane[slot].copy_(packed[token])
                     plane_offset += size * width
+            env.pending.remove(complete)
 
         env.pending.append(complete)
+        env.active.queue.append(complete)
         if env.launch_error:
             raise RuntimeError("native launch failed")
 
@@ -477,7 +520,8 @@ def test_slot_bounds_and_h2d_duplicates(row_env, slots, direction, error):
         ("group_type", "kv_group"),
     ],
 )
-def test_validation_fails_before_native_launch(row_env, case, error):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_validation_fails_before_native_launch(row_env, case, error, asynchronous):
     env = row_env
     planes = list(env.planes(0))
     chunks = _chunks(planes, [2, 1])
@@ -561,10 +605,13 @@ def test_validation_fails_before_native_launch(row_env, case, error):
         kwargs["direction"] = 1
     elif case == "group_type":
         kwargs["kv_group"] = True
+    method = (
+        env.connector.prepare_layerwise_prefill_row
+        if asynchronous
+        else env.connector.transfer_layerwise_prefill_row
+    )
     with pytest.raises(ValueError, match=error):
-        env.connector.transfer_layerwise_prefill_row(
-            planes, chunks, starts, ends, slots, **kwargs
-        )
+        method(planes, chunks, starts, ends, slots, **kwargs)
     assert not env.calls and not env.events
 
 
@@ -1126,3 +1173,590 @@ def test_host_timings_include_failed_submission_and_fence(
     if failure == "fence":
         env.sync_error = False
         env.store.synchronize()
+
+
+def _prepare_async(env, *, group=1, direction=True, slots=None):
+    planes = env.planes(group)
+    return env.connector.prepare_layerwise_prefill_row(
+        planes,
+        _chunks(planes, [2, 1]),
+        [100, 102],
+        [102, 103],
+        torch.tensor([4, 0, 9]) if slots is None else slots,
+        kv_group=group,
+        direction=direction,
+        slot_mapping_base=100,
+    )
+
+
+@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize("direction", [False, True])
+@pytest.mark.parametrize("prepared_slots", [False, True])
+def test_async_enqueue_has_no_allocation_readback_or_host_fence(
+    row_env,
+    monkeypatch,
+    group,
+    direction,
+    prepared_slots,
+):
+    env = row_env
+    slots = torch.tensor([4, 0, 9])
+    if prepared_slots:
+        slots = env.connector.prepare_layerwise_prefill_slots(
+            slots,
+            kv_group=group,
+            capacity=12,
+        )
+    row = _prepare_async(env, group=group, direction=direction, slots=slots)
+    chunks, planes = row._args[:2]
+    snapshots = [p.as_subclass(torch.Tensor).clone() for p in planes]
+    assert not env.calls and not env.pending
+    assert not env.connector._layerwise_prefill_inflight
+    assert not any(e[1] in ("sync", "event_sync") for e in env.events)
+    assert env.connector.supports_layerwise_prefill_async_rows is True
+    before = env.host_ops.copy()
+    env.events.clear()
+    native = npu_connectors.lmc_ops.dense_mla_dsa_batched_direct_kv_transfer
+
+    def launch(*args):
+        assert env.connector._layerwise_prefill_inflight[id(row)] is row
+        assert row._state == "submitted"
+        native(*args)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail(
+            "Pre-HCOM submit/wait performed allocation, validation or host sync"
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            npu_connectors.lmc_ops, "dense_mla_dsa_batched_direct_kv_transfer", launch
+        )
+        for name in ("tensor", "empty", "empty_like", "zeros", "ones", "cat"):
+            patch.setattr(torch, name, forbidden)
+        for name in ("clone", "to", "cpu", "tolist", "item", "__getitem__"):
+            patch.setattr(torch.Tensor, name, forbidden)
+        patch.setattr(torch.npu, "Event", forbidden)
+        patch.setattr(_Stream, "synchronize", forbidden)
+        patch.setattr(_Event, "synchronize", forbidden)
+        patch.setattr(npu_connectors, "perf_counter", forbidden)
+        patch.setattr(env.connector, "_validate_layerwise_prefill_row", forbidden)
+        patch.setattr(npu_connectors.lmc_ops, "get_device_ptr", forbidden)
+        ticket = env.connector.submit_layerwise_prefill_row(row)
+        assert ticket is row
+        assert env.connector.wait_layerwise_prefill_row(ticket) is None
+    assert env.host_ops == before
+    stream = "store" if direction else "load"
+    assert env.events == [
+        (stream, "enter"),
+        (stream, "wait", "compute"),
+        (stream, "launch"),
+        (stream, "record", ticket.done_event),
+        (stream, "exit"),
+        ("compute", "wait_event", ticket.done_event),
+    ]
+    assert len(env.pending) == 1
+    for chunk in chunks:
+        assert bool((chunk == -7).all())
+    for plane, snapshot in zip(planes, snapshots, strict=True):
+        torch.testing.assert_close(plane.as_subclass(torch.Tensor), snapshot)
+    assert all(ref() is not None for ref in env.last_refs)
+    assert env.connector.complete_layerwise_prefill_row(ticket) is None
+    assert not env.pending and not env.connector._layerwise_prefill_inflight
+    assert env.events[-1] == (stream, "event_sync", ticket.done_event)
+    assert not ticket._args and not ticket._owners and not ticket._tensor_identities
+    for plane, snapshot in zip(planes, snapshots, strict=True):
+        flat = plane.as_subclass(torch.Tensor).view(12, -1)
+        if direction:
+            torch.testing.assert_close(plane.as_subclass(torch.Tensor), snapshot)
+        else:
+            assert bool((flat[[4, 0, 9]] == -7).all())
+    if direction:
+        for chunk, selected in zip(chunks, ([4, 0], [9]), strict=True):
+            offset = 0
+            for snapshot in snapshots:
+                expected = snapshot.view(12, -1)[selected].flatten()
+                torch.testing.assert_close(
+                    chunk[offset : offset + expected.numel()], expected
+                )
+                offset += expected.numel()
+
+
+def test_async_post_sfa_dependency_and_compute_consumer(row_env):
+    env = row_env
+    row = _prepare_async(env, direction=False)
+    chunks, planes = row._args[:2]
+    chunks[0].fill_(21)
+    chunks[1].fill_(22)
+    # Work added AFTER prepare must precede the native write, not overwrite it.
+    env.compute.queue.append(lambda: planes[0].fill_(31))
+    ticket = env.connector.submit_layerwise_prefill_row(row)
+    env.connector.wait_layerwise_prefill_row(ticket)
+    observed = []
+    env.compute.queue.append(
+        lambda: observed.append(
+            planes[0].as_subclass(torch.Tensor).view(12, -1).clone()
+        )
+    )
+    assert not observed and env.pending
+    env.compute.run_to(len(env.compute.queue))
+    assert not env.pending
+    assert bool((observed[0][[4, 0]] == 21).all())
+    assert bool((observed[0][9] == 22).all())
+    assert bool((observed[0][1] == 31).all())
+    assert env.connector._layerwise_prefill_inflight  # Device wait did not release.
+    env.connector.complete_layerwise_prefill_row(ticket)
+
+
+@pytest.mark.parametrize("complete_store_first", [False, True])
+def test_async_old_bank_event_orders_load_after_store(row_env, complete_store_first):
+    env = row_env
+    store = _prepare_async(env)
+    chunks, src = store._args[:2]
+    dst = env.planes(1)
+    dst[0].fill_(-9)
+    load = env.connector.prepare_layerwise_prefill_row(
+        dst,
+        chunks,
+        [0, 2],
+        [2, 3],
+        torch.tensor([4, 0, 9]),
+        kv_group=1,
+        direction=False,
+    )
+    env.connector.submit_layerwise_prefill_row(store)
+    if complete_store_first:
+        env.connector.complete_layerwise_prefill_row(store)
+    event = store.done_event
+    env.connector.submit_layerwise_prefill_row(load, wait_event=event)
+    env.connector.wait_layerwise_prefill_row(load)
+    # Running just the consumer recursively executes event dependencies, not
+    # every stream. Missing wait_event would read the CPU sentinel instead.
+    env.compute.run_to(len(env.compute.queue))
+    assert not env.pending
+    torch.testing.assert_close(
+        dst[0].as_subclass(torch.Tensor).view(12, -1)[[4, 0, 9]],
+        src[0].as_subclass(torch.Tensor).view(12, -1)[[4, 0, 9]],
+    )
+    assert ("load", "wait_event", event) in env.events
+    env.connector.drain_layerwise_prefill_transfers()
+    assert not env.connector._layerwise_prefill_inflight
+
+
+def test_async_completion_fences_event_not_later_stream_work(row_env):
+    env = row_env
+    first, later = _prepare_async(env), _prepare_async(env)
+    env.connector.submit_layerwise_prefill_row(first)
+    env.connector.submit_layerwise_prefill_row(later)
+    env.connector.complete_layerwise_prefill_row(first)
+    assert len(env.pending) == 1
+    assert list(env.connector._layerwise_prefill_inflight.values()) == [later]
+    assert not any(e[1] == "sync" for e in env.events)
+    env.connector.drain_layerwise_prefill_transfers()
+    assert not env.pending
+
+
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("prepared_slots", [False, True])
+def test_async_metadata_snapshot_and_inference_payloads(
+    row_env, inference, prepared_slots
+):
+    env = row_env
+    with torch.inference_mode(inference):
+        mapping = torch.tensor([4, 0, 9])
+        plan = (
+            env.connector.prepare_layerwise_prefill_slots(
+                mapping,
+                kv_group=1,
+                capacity=12,
+            )
+            if prepared_slots
+            else mapping
+        )
+        row = _prepare_async(env, slots=plan)
+        for tensor, version in row._metadata_versions:
+            assert not torch.is_inference(tensor) and tensor._version == version
+        mapping.fill_(-1)
+        # Native config is all values, not a reference to mutable layout mirrors.
+        env.connector.k_hidden_dims = -1
+        env.connector.kv_format = KVCacheFormat.UNDEFINED
+        env.connector.submit_layerwise_prefill_row(row)
+        env.connector.complete_layerwise_prefill_row(row)
+    assert env.calls[0]["slots"] == [4, 0, 9]
+    assert env.calls[0]["widths"] == (32, 0, 32)
+
+
+@pytest.mark.parametrize("index", [2, 3, 4, 14])
+@pytest.mark.parametrize("inference", [False, True])
+def test_async_same_value_metadata_write_is_rejected(row_env, index, inference):
+    env = row_env
+    row = _prepare_async(env)
+    tensor = row._args[index]
+    with torch.inference_mode(inference):
+        tensor[0] = tensor[0]  # Even unchanged/all-ones metadata must fail closed.
+    env.events.clear()
+    with pytest.raises(ValueError, match="metadata was mutated"):
+        env.connector.submit_layerwise_prefill_row(row)
+    assert (
+        not env.events
+        and not env.calls
+        and not env.connector._layerwise_prefill_inflight
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "connector",
+        "copy",
+        "layout",
+        "group",
+        "capacity",
+        "chunk",
+        "storage",
+        "dtype",
+        "stream",
+        "device",
+        "format",
+        "width",
+        "slots",
+    ],
+)
+def test_async_binding_or_tensor_identity_mutation_fails_before_enqueue(row_env, case):
+    env = row_env
+    plan = env.connector.prepare_layerwise_prefill_slots(
+        torch.tensor([4, 0, 9]),
+        kv_group=1,
+        capacity=12,
+    )
+    row = _prepare_async(env, slots=plan)
+    connector = env.connector
+    if case == "connector":
+        connector = copy.copy(connector)
+    elif case == "copy":
+        row = copy.copy(row)
+    elif case == "layout":
+        connector._group_layouts[1] = copy.copy(connector._group_layouts[1])
+    elif case == "group":
+        connector._group_layouts[1] = connector._group_layouts[0]
+    elif case == "capacity":
+        row._args[1][0].resize_(2, 4, 1, 32)
+    elif case == "chunk":
+        row._args[0][0].resize_(1)
+    elif case == "storage":
+        row._args[0][0].set_(torch.zeros_like(row._args[0][0]))
+    elif case == "dtype":
+        connector.dtype = torch.float16
+    elif case == "stream":
+        connector.store_stream = _Stream(env, "other_store")
+    elif case == "device":
+        connector.store_stream.device = _OTHER_DEVICE
+    elif case == "format":
+        connector._group_layouts[1].kv_format = KVCacheFormat.MLA_LATENT
+    elif case == "width":
+        connector._group_layouts[1].dsa_hidden_dims = 64
+    elif case == "slots":
+        plan._slots.fill_(1)
+    env.events.clear()
+    with pytest.raises(ValueError):
+        connector.submit_layerwise_prefill_row(row)
+    assert (
+        not env.events
+        and not env.calls
+        and not env.connector._layerwise_prefill_inflight
+    )
+
+
+def test_async_ticket_lifecycle_and_frozen_fields(row_env):
+    env = row_env
+    row = _prepare_async(env)
+    with pytest.raises(ValueError, match="requires successful submission"):
+        _ = row.done_event
+    for method in ("wait_layerwise_prefill_row", "complete_layerwise_prefill_row"):
+        with pytest.raises(ValueError):
+            getattr(env.connector, method)(row)
+        with pytest.raises(ValueError, match="another connector"):
+            getattr(copy.copy(env.connector), method)(row)
+    for name, value in (
+        ("_args", ()),
+        ("_kv_group", 0),
+        ("_state", "complete"),
+        ("done_event", None),
+        ("_direction", False),
+    ):
+        with pytest.raises(FrozenInstanceError):
+            setattr(row, name, value)
+    env.connector.submit_layerwise_prefill_row(row)
+    with pytest.raises(ValueError, match="already been submitted"):
+        env.connector.submit_layerwise_prefill_row(row)
+    event = row.done_event
+    env.connector.complete_layerwise_prefill_row(row)
+    gc.collect()
+    assert all(ref() is None for ref in env.last_refs)
+    env.connector.complete_layerwise_prefill_row(row)  # Idempotent, no extra fence.
+    env.connector.wait_layerwise_prefill_row(row)
+    assert row.done_event is event
+    with pytest.raises(ValueError, match="already been submitted"):
+        env.connector.submit_layerwise_prefill_row(row)
+    assert sum(e[1] == "event_sync" for e in env.events) == 1
+
+
+@pytest.mark.parametrize("failure", ["launch", "record", "wait"])
+def test_async_partial_submission_errors_are_registered_and_drained(
+    row_env,
+    monkeypatch,
+    failure,
+):
+    env = row_env
+    good = _prepare_async(env, direction=False)
+    bad = _prepare_async(env)
+    env.connector.submit_layerwise_prefill_row(good)
+    good_refs = env.last_refs
+    if failure == "launch":
+        env.launch_error = True
+    elif failure == "record":
+        env.event_record_error = True
+    else:
+        bad_id, bad_ref = id(bad), weakref.ref(bad)
+
+        def fail_wait(_producer):
+            assert env.connector._layerwise_prefill_inflight[bad_id] is bad_ref()
+            raise RuntimeError("wait failed")
+
+        monkeypatch.setattr(env.store, "wait_stream", fail_wait)
+    with pytest.raises(RuntimeError, match="failed"):
+        env.connector.submit_layerwise_prefill_row(bad)
+    assert list(env.connector._layerwise_prefill_inflight.values()) == [good, bad]
+    assert not any(e[1] in ("sync", "event_sync") for e in env.events)
+    assert bad._recorded is False  # Preparation's stale event is not completion.
+    with pytest.raises(ValueError):
+        env.connector.wait_layerwise_prefill_row(bad)
+    refs = good_refs + env.last_refs
+    del good, bad
+    gc.collect()
+    assert all(ref() is not None for ref in refs)
+    with pytest.raises(RuntimeError, match="failed"):
+        env.connector.drain_layerwise_prefill_transfers()
+    assert not env.pending and not env.connector._layerwise_prefill_inflight
+    assert ("store", "sync") in env.events
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
+def test_async_complete_partial_launch_uses_event_and_preserves_error(row_env):
+    env = row_env
+    row = _prepare_async(env)
+    env.launch_error = True
+    with pytest.raises(RuntimeError, match="native launch failed") as launch:
+        env.connector.submit_layerwise_prefill_row(row)
+    with pytest.raises(RuntimeError, match="native launch failed") as completion:
+        env.connector.complete_layerwise_prefill_row(row)
+    assert completion.value is launch.value
+    assert not env.pending and not env.connector._layerwise_prefill_inflight
+    assert not any(e[1] == "sync" for e in env.events)
+    assert row._state == "failed" and not row._owners
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_async_unknown_fence_poison_quarantines_owners_and_drain_retries(
+    row_env, partial
+):
+    env = row_env
+    row = _prepare_async(env)
+    env.launch_error = partial
+    if partial:
+        with pytest.raises(RuntimeError, match="native launch failed"):
+            env.connector.submit_layerwise_prefill_row(row)
+    else:
+        env.connector.submit_layerwise_prefill_row(row)
+    env.sync_error = True
+    with pytest.raises(RuntimeError, match="native launch failed|completion failed"):
+        env.connector.drain_layerwise_prefill_transfers()
+    assert row._owners and env.pending
+    assert env.connector._layerwise_prefill_inflight[id(row)] is row
+    gc.collect()
+    assert all(ref() is not None for ref in env.last_refs)
+    for action in (
+        lambda: _prepare_async(env),
+        lambda: env.connector.submit_layerwise_prefill_row(row),
+        lambda: env.connector.transfer_layerwise_prefill_row(
+            (),
+            (),
+            (),
+            (),
+            None,
+            kv_group=1,
+            direction=True,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="previous prefill row completion fence"):
+            action()
+    env.sync_error = False
+    with pytest.raises(RuntimeError, match="native launch failed|previous prefill row"):
+        env.connector.drain_layerwise_prefill_transfers()
+    assert not row._owners and not env.pending
+    assert not env.connector._layerwise_prefill_inflight
+    gc.collect()
+    assert all(ref() is None for ref in env.last_refs)
+
+
+def test_async_drain_attempts_remaining_rows_after_failed_event_fence(
+    row_env, monkeypatch
+):
+    env = row_env
+    first, second = _prepare_async(env), _prepare_async(env, direction=False)
+    env.connector.submit_layerwise_prefill_row(first)
+    env.connector.submit_layerwise_prefill_row(second)
+
+    def fail():
+        raise RuntimeError("first fence failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(first.done_event, "synchronize", fail)
+        with pytest.raises(RuntimeError, match="first fence failed"):
+            env.connector.drain_layerwise_prefill_transfers()
+        assert list(env.connector._layerwise_prefill_inflight.values()) == [first]
+        assert second._state == "complete" and not second._owners
+    with pytest.raises(RuntimeError, match="previous prefill row"):
+        env.connector.drain_layerwise_prefill_transfers()
+
+
+def test_async_empty_restore_has_dependency_event_without_native(row_env):
+    env = row_env
+    env.connector._group_layouts.clear()
+    row = env.connector.prepare_layerwise_prefill_row(
+        (),
+        (),
+        (),
+        (),
+        None,
+        kv_group=1,
+        direction=False,
+    )
+    assert not row._args
+    env.connector.submit_layerwise_prefill_row(row)
+    env.connector.wait_layerwise_prefill_row(row)
+    env.connector.complete_layerwise_prefill_row(row)
+    assert row._state == "complete" and not env.calls
+    assert ("compute", "wait_event", row.done_event) in env.events
+    assert not any(e[1] == "sync" for e in env.events)
+
+
+def test_async_hooks_reject_storage_executor_thread(row_env, monkeypatch):
+    env = row_env
+    row = _prepare_async(env)
+    monkeypatch.setattr(npu_connectors, "get_ident", lambda: -1)
+    for action in (
+        lambda: _prepare_async(env),
+        lambda: env.connector.submit_layerwise_prefill_row(row),
+        lambda: env.connector.wait_layerwise_prefill_row(row),
+        lambda: env.connector.complete_layerwise_prefill_row(row),
+        env.connector.drain_layerwise_prefill_transfers,
+    ):
+        with pytest.raises(RuntimeError, match="model/control thread"):
+            action()
+    assert not env.calls
+
+
+@pytest.mark.parametrize("failure", ["registration", "allocation", "event"])
+@pytest.mark.parametrize("fence_fails", [False, True])
+def test_async_preparation_failure_fences_metadata_or_quarantines(
+    row_env,
+    monkeypatch,
+    failure,
+    fence_fails,
+):
+    env = row_env
+    env.sync_error = fence_fails
+    if failure == "registration":
+        env.pointer_error = "raise"
+    elif failure == "event":
+        env.event_record_error = True
+    else:
+        factory = torch.tensor
+
+        def fail_sizes(*args, **kwargs):
+            if kwargs.get("device") is _DEVICE and kwargs.get("dtype") == torch.int32:
+                raise RuntimeError("metadata allocation failed")
+            return factory(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "tensor", fail_sizes)
+    with pytest.raises(RuntimeError, match="failed"):
+        _prepare_async(env)
+    assert not env.calls and not env.connector._layerwise_prefill_inflight
+    assert env.events[-1] == ("store", "sync")
+    if fence_fails:
+        assert env.connector._layerwise_prefill_row_failed_owners
+        refs = [
+            weakref.ref(owner)
+            for owner in env.connector._layerwise_prefill_row_failed_owners
+            if isinstance(owner, torch.Tensor)
+        ]
+        gc.collect()
+        assert all(ref() is not None for ref in refs)
+        with pytest.raises(RuntimeError, match="completion failed"):
+            env.connector.drain_layerwise_prefill_transfers()
+        assert all(ref() is not None for ref in refs)
+        env.sync_error = False
+        with pytest.raises(RuntimeError, match="previous prefill row"):
+            env.connector.drain_layerwise_prefill_transfers()
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+    else:
+        assert (
+            getattr(env.connector, "_layerwise_prefill_row_failed_owners", None) is None
+        )
+
+
+def test_async_partial_launch_and_failed_complete_preserves_both_errors(row_env):
+    env = row_env
+    row = _prepare_async(env)
+    env.launch_error = True
+    with pytest.raises(RuntimeError, match="native launch failed"):
+        env.connector.submit_layerwise_prefill_row(row)
+    env.event_record_error = True
+    with pytest.raises(RuntimeError, match="native launch failed") as error:
+        env.connector.complete_layerwise_prefill_row(row)
+    assert str(error.value.__cause__) == "event record failed"
+    assert row._owners and env.connector._layerwise_prefill_inflight
+    assert not any(e[1] in ("sync", "event_sync") for e in env.events)
+    # drain must not retry the broken event: it uses the recorded transfer stream.
+    with pytest.raises(RuntimeError, match="native launch failed"):
+        env.connector.drain_layerwise_prefill_transfers()
+    assert not env.pending and not row._owners
+
+
+def test_async_512_chunk_metadata_is_row_owned_and_never_refilled(row_env):
+    env = row_env
+    sizes = [1] * 511 + [3]
+    planes = env.planes(1, blocks=129)
+    slots = env.connector.prepare_layerwise_prefill_slots(
+        torch.arange(514),
+        kv_group=1,
+        capacity=516,
+    )
+    first = env.connector.prepare_layerwise_prefill_row(
+        planes,
+        _chunks(planes, sizes),
+        list(range(512)),
+        list(range(1, 512)) + [514],
+        slots,
+        kv_group=1,
+        direction=True,
+    )
+    small = _prepare_async(env)
+    assert first._args[4].data_ptr() != small._args[4].data_ptr()
+    snapshots = tuple(t.clone() for t, _ in first._metadata_versions)
+    before = env.host_ops.copy()
+    env.connector.submit_layerwise_prefill_row(first)
+    env.connector.submit_layerwise_prefill_row(small)
+    assert env.host_ops == before
+    assert env.calls[0]["sizes"] == sizes
+    assert env.calls[0]["offsets"] == list(range(512))
+    for (tensor, version), snapshot in zip(
+        first._metadata_versions, snapshots, strict=True
+    ):
+        assert tensor._version == version
+        torch.testing.assert_close(tensor, snapshot)
+    env.connector.drain_layerwise_prefill_transfers()
+    assert not env.pending

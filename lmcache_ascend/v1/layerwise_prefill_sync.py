@@ -11,7 +11,7 @@ from concurrent.futures import Future
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from time import perf_counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
@@ -635,9 +635,9 @@ class LayerwisePrefillSyncBackend:
                         keep = self._commit_starts[req.request_id] // 256
                         for group, count in enumerate(self._view.layer_counts):
                             plan = self._plans[req.request_id, group, req.compute_end]
-                            for base in range(keep, len(plan), 16):
+                            for chunks in self._page_batches(req, group, keep):
                                 keys, objects = [], []
-                                for chunk in range(base, min(base + 16, len(plan))):
+                                for chunk in chunks:
                                     pages += plan[chunk][1] - plan[chunk][0] == 256
                                     for row in range(count):
                                         prefix = self._prefixes[
@@ -650,14 +650,13 @@ class LayerwisePrefillSyncBackend:
                                         objects.append(prefix.objects[chunk])
                                 for obj in objects:
                                     obj.ref_count_up()
-                                self._engine.storage_manager.batched_put_sync_required(
-                                    keys,
-                                    objects,
-                                    required_backends=("RemoteBackend",),
-                                    location="RemoteBackend",
-                                )
+                                self._submit_required_remote(keys, objects)
             except Exception as exc:
                 error = exc
+            try:
+                self._drain_required_remote()
+            except Exception as exc:
+                error = error or exc
             self._ack(("commit",), error)
             self._step_future.set_result(None)
         persist_seconds = perf_counter() - persist_started
@@ -665,6 +664,7 @@ class LayerwisePrefillSyncBackend:
         # NPU kernel time. Emit no per-layer records or diagnostic device reads.
         if self._engine.metadata.is_first_rank():
             elapsed = perf_counter() - self._step_started
+            window_stats = getattr(self, "window_stats", None)
             logger.info(
                 "[PREFILL_SYNC_STEP] event=end step=%d requests=%d saved=%s "
                 "elapsed_ms=%.3f bind_ms=%.3f load_ms=%.3f save_ms=%.3f "
@@ -673,7 +673,7 @@ class LayerwisePrefillSyncBackend:
                 "prepared_slots=%d transfer_timing=%s "
                 "bind_parts_ms=(plan,slots,ack):%s "
                 "load_parts_ms=(prepare,submit,fence,ack):%s "
-                "save_parts_ms=(prepare,submit,fence,ack):%s",
+                "save_parts_ms=(prepare,submit,fence,ack):%s window_stats=%s",
                 self._step,
                 len(self._requests),
                 tuple(self._saved),
@@ -707,6 +707,7 @@ class LayerwisePrefillSyncBackend:
                         ("load", "save"), self._transfer_timings, strict=True
                     )
                 ),
+                window_stats() if callable(window_stats) else {},
             )
         self._bound = False
         self._requests = ()
@@ -923,6 +924,26 @@ class LayerwisePrefillSyncBackend:
                     "Layerwise-prefill device completion fence failed"
                 ) from exc
             raise
+
+    def _page_batches(
+        self, req: LayerwisePrefillRequest, group: int, keep: int
+    ) -> Iterator[range]:
+        """Yield indivisible token chunks for strict complete-group publication."""
+        plan = self._plans[req.request_id, group, req.compute_end]
+        for base in range(keep, len(plan), 16):
+            yield range(base, min(base + 16, len(plan)))
+
+    def _submit_required_remote(self, keys: list, objects: list[MemoryObj]) -> None:
+        """Consume borrowed references through required remote persistence."""
+        self._engine.storage_manager.batched_put_sync_required(
+            keys,
+            objects,
+            required_backends=("RemoteBackend",),
+            location="RemoteBackend",
+        )
+
+    def _drain_required_remote(self) -> None:
+        """Join any deferred strict puts before the final all-TP commit ACK."""
 
     def _plan(
         self, req: LayerwisePrefillRequest, end: int, group: int, row: int

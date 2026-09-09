@@ -65,6 +65,7 @@ from lmcache_ascend.v1.layerwise_prefill_sync import (
     LayerwisePrefillFenceError,
     LayerwisePrefillSyncBackend,
 )
+from lmcache_ascend.v1.layerwise_prefill_async import LayerwisePrefillAsyncBackend
 from lmcache_ascend.v1.layerwise_prefill_window import (
     LayerwisePrefillNPUWindowBackend,
 )
@@ -464,7 +465,7 @@ class AscendLMCacheEngine(LMCacheEngine):
     def layerwise_prefill_window_backend(
         self,
     ) -> Optional[Union[LayerwisePrefillNPUWindowBackend, LayerwisePrefillSyncBackend]]:
-        """Expose sync-only production P, or an explicitly opted-in window.
+        """Expose production P with an explicitly enabled intra-step async window.
 
         With P enabled, unsupported configurations raise before capabilities
         can be frozen; there is no legacy or transfer-window fallback. Live
@@ -476,7 +477,15 @@ class AscendLMCacheEngine(LMCacheEngine):
             return backend
         if p_enabled:
             # P must never fall through to a window or the legacy all-layer path.
-            backend = LayerwisePrefillSyncBackend(
+            window = self.config.get_extra_config_value(
+                "layerwise_prefill_transfer_window", False
+            )
+            if type(window) is not bool:
+                raise ValueError("layerwise_prefill_transfer_window must be a boolean")
+            backend_cls = (
+                LayerwisePrefillAsyncBackend if window else LayerwisePrefillSyncBackend
+            )
+            backend = backend_cls(
                 self, getattr(self, "_dsa_kv_topology_view", None)
             )
             self._layerwise_prefill_window_backend = backend
@@ -594,6 +603,44 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "before freezing layerwise-prefill capabilities"
             )
         parallel = serving.parallel_config
+        if config.get_extra_config_value("layerwise_prefill_transfer_window", False):
+            scheduler = getattr(serving, "scheduler_config", None)
+            if (
+                not mooncake_page_layout_enabled(config)
+                or getattr(scheduler, "async_scheduling", None) is not False
+                or getattr(parallel, "distributed_executor_backend", None)
+                not in ("mp", "uni")
+            ):
+                raise ValueError(
+                    "Layerwise-prefill transfer window requires page-first, "
+                    "--no-async-scheduling and the mp/uni executor"
+                )
+            scheduler_cls = scheduler.get_scheduler_cls()
+            if (
+                scheduler_cls.__module__ != "vllm.v1.core.sched.scheduler"
+                or scheduler_cls.__qualname__ != "Scheduler"
+            ):
+                raise ValueError(
+                    "Layerwise-prefill transfer window requires the unpatched "
+                    "synchronous Scheduler; disable Balance/Recompute/custom scheduling"
+                )
+            if (
+                getattr(
+                    self.gpu_connector, "supports_layerwise_prefill_async_rows", False
+                )
+                is not True
+                or any(
+                    not callable(getattr(self.gpu_connector, name, None))
+                    for name in (
+                        "prepare_layerwise_prefill_row",
+                        "submit_layerwise_prefill_row",
+                        "wait_layerwise_prefill_row",
+                        "complete_layerwise_prefill_row",
+                        "drain_layerwise_prefill_transfers",
+                    )
+                )
+            ):
+                raise ValueError("Layerwise-prefill requires concrete async row hooks")
         speculative = getattr(serving, "speculative_config", None)
         if speculative is not None and (
             speculative.method != "mtp"
