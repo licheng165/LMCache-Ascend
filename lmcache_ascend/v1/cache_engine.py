@@ -1218,30 +1218,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                 if len(envelope.handles) != len(keys):
                     raise ValueError("Layerwise-prefill shared row has missing handles")
                 objects = []
-                for index, (key, start, end, handle) in enumerate(
-                    zip(keys, starts, ends, envelope.handles, strict=True)
-                ):
-                    shape, dtype, fmt = self.layerwise_prefill_row_metadata(
-                        group, end - start
-                    )
-                    obj = self.shared_cpu_cache_passive_allocator.create_view(
-                        handle,
-                        expected_request_id=request_id,
-                        expected_phase=phase,
-                        expected_layer_id=row,
-                        expected_kv_group=group,
-                        expected_chunk_index=index,
-                        expected_key=key,
-                        expected_shape=shape,
-                        expected_dtype=dtype,
-                        expected_fmt=fmt,
-                        expected_cached_positions=range(start, end),
-                        expected_producer_rank=self.metadata.first_rank,
-                    )
-                    with PinMonitor.GetOrCreate().protect_pins() as pins:
+                if not keys and not starts and not ends:
+                    return objects
+                # View creation performs no storage I/O or slab allocation.
+                # Exceptional scope exit adopts the prefix before outer cleanup.
+                with PinMonitor.GetOrCreate().protect_pins() as pins:
+                    for index, (key, start, end, handle) in enumerate(
+                        zip(keys, starts, ends, envelope.handles, strict=True)
+                    ):
+                        shape, dtype, fmt = self.layerwise_prefill_row_metadata(
+                            group, end - start
+                        )
+                        obj = self.shared_cpu_cache_passive_allocator.create_view(
+                            handle,
+                            expected_request_id=request_id,
+                            expected_phase=phase,
+                            expected_layer_id=row,
+                            expected_kv_group=group,
+                            expected_chunk_index=index,
+                            expected_key=key,
+                            expected_shape=shape,
+                            expected_dtype=dtype,
+                            expected_fmt=fmt,
+                            expected_cached_positions=range(start, end),
+                            expected_producer_rank=self.metadata.first_rank,
+                        )
                         obj.pin()
                         pins.append(obj)
-                    objects.append(obj)
+                        objects.append(obj)
             return objects
         except Exception as exc:
             if owned or not self.metadata.is_first_rank():

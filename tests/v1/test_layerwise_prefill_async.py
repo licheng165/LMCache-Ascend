@@ -297,6 +297,7 @@ def test_async_host_timing_scopes_include_save_preparation_and_publication_ack(
 
     _execute(engine, backend, [_request()])
     assert backend.window_stats()["async_host"] == {
+        "window_bind": (1, 32.0, 32.0),
         # H2D excludes source resolution, planning and preparation ACKs.
         "prepare_load": (101, 101.0, 1.0),
         # One scope per row: plan + two metadata/allocations + connector prepare.
@@ -403,6 +404,7 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
             load_count = 101 * request_count
             save_count = load_count if rank == 0 else 101
             host_counts = {
+                "window_bind": 1,
                 "prepare_load": load_count,
                 "prepare_save": 101,
                 "submit_load": load_count,

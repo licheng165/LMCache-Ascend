@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Iterator
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
 from lmcache.v1.pin_monitor import PinMonitor
@@ -949,11 +949,40 @@ class LayerwisePrefillSyncBackend:
         self, req: LayerwisePrefillRequest, end: int, group: int, row: int
     ) -> tuple[list[int], list[int], list[CacheEngineKey]]:
         plan = self._plans[req.request_id, group, end]
+        prior = self._prefixes.get(
+            (req.request_id, req.allocation_generation, group, row)
+        )
+        keep = (
+            min(req.compute_start, prior.ends[-1] if prior.ends else 0) // 256
+            if prior is not None and end == req.compute_end
+            else 0
+        )
         starts, ends, keys = [], [], []
-        for start, stop, key in plan:
+        for chunk, (start, stop, key) in enumerate(plan):
             starts.append(start)
             ends.append(stop)
-            keys.append(key.get_layer(row))
+            retained = prior.keys[chunk] if chunk < keep else None
+            # Match the entire get_layer projection, including metadata ignored
+            # by key equality. Subclasses/custom keys keep their original API.
+            if (
+                type(key) is CacheEngineKey
+                and type(retained) is LayerCacheEngineKey
+                and prior.starts[chunk] == start
+                and prior.ends[chunk] == stop
+                and row == retained.layer_id
+                and key.model_name == retained.model_name
+                and key.world_size == retained.world_size
+                and key.worker_id == retained.worker_id
+                and key.chunk_hash == retained.chunk_hash
+                and key.dtype == retained.dtype
+                and key.request_configs == retained.request_configs
+                and key.tags == retained.tags
+                and key._dtype_str == retained._dtype_str
+                and key.kv_group == retained.kv_group
+            ):
+                keys.append(retained)
+            else:
+                keys.append(key.get_layer(row))
         return starts, ends, keys
 
     @staticmethod

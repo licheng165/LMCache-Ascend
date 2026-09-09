@@ -9,11 +9,15 @@ The shared step Future is an assembly/commit barrier, not an admission credit.
 # Standard
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from functools import wraps
 from time import perf_counter
 from typing import Any, Callable, Iterator, NoReturn
+import gc
+import weakref
 
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
+from lmcache.logging import init_logger
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
@@ -26,6 +30,94 @@ from lmcache_ascend.v1.layerwise_prefill_sync import (
     LayerwisePrefillSyncBackend,
     _RowPrefix,
 )
+
+
+logger = init_logger(__name__)
+
+
+class _StepGC:
+    """Bounded process-wide observations, not attribution to a row or GC policy.
+
+    Arrays are ordered by generation 0/1/2. Only collections whose start and
+    stop are observed count; manual collections count even with GC disabled.
+    The global callback/finalizer owns only these counters, never the backend.
+    """
+
+    def __init__(self, step: int) -> None:
+        self.step = step
+        self.enabled, self.threshold = gc.isenabled(), gc.get_threshold()
+        self.started: list[float | None] = [None, None, None]
+        self.counts = [0, 0, 0]
+        self.total = [0.0, 0.0, 0.0]
+        self.maximum = [0.0, 0.0, 0.0]
+        self.registry = gc.callbacks
+        self.active = True
+
+    def __call__(self, phase: str, info: dict) -> None:
+        # No per-collection containers, logging, backend access or device work.
+        try:
+            generation = info["generation"]
+            if (
+                not self.active
+                or type(generation) is not int
+                or not 0 <= generation <= 2
+            ):
+                return
+            if phase == "start":
+                self.started[generation] = perf_counter()
+            elif phase == "stop":
+                started = self.started[generation]
+                self.started[generation] = None
+                if started is not None:
+                    seconds = perf_counter() - started
+                    self.counts[generation] += 1
+                    self.total[generation] += seconds
+                    if seconds > self.maximum[generation]:
+                        self.maximum[generation] = seconds
+        except BaseException:
+            pass  # Diagnostics must not escape into GC or transfer error handling.
+
+    def close(self) -> None:
+        self.active = False
+        try:
+            for index, callback in enumerate(self.registry):
+                if callback is self:
+                    del self.registry[index]
+                    break
+        except BaseException:
+            pass  # Diagnostics must not raise from a weak finalizer.
+
+    def stats(self) -> dict[str, Any]:
+        try:
+            return {
+                "enabled": self.enabled,
+                "threshold": self.threshold,
+                "counts": tuple(self.counts),
+                "total_ms": tuple(round(value * 1000, 3) for value in self.total),
+                "max_ms": tuple(round(value * 1000, 3) for value in self.maximum),
+            }
+        except BaseException:
+            return {}
+
+
+def _gc_diagnostics(*, on_error_only: bool = False) -> Callable:
+    """Detach on terminal exits, including raw interrupts, without draining owners."""
+
+    def decorate(function: Callable) -> Callable:
+        @wraps(function)
+        def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+            succeeded = False
+            try:
+                result = function(self, *args, **kwargs)
+                succeeded = True
+                return result
+            finally:
+                if not on_error_only or not succeeded:
+                    self._stop_gc_step()
+
+        return wrapped
+
+    return decorate
 
 
 @dataclass
@@ -90,6 +182,40 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         self._device_jobs = self._remote_jobs = 0
         self._peak_jobs = self._peak_bytes = self._peak_futures = 0
         self._host_timings: dict[str, tuple[int, float, float]] = {}
+        self._gc: _StepGC | None = None
+        self._gc_finalizer: weakref.finalize | None = None
+
+    def _start_gc_step(self) -> None:
+        try:
+            if self._gc_finalizer is not None:
+                return  # A rejected rebind must not duplicate the live callback.
+            self._gc = None
+            self._gc = _StepGC(self._step + 1)
+            # Register cleanup first so even interrupted registration cannot leak.
+            self._gc_finalizer = weakref.finalize(self, self._gc.close)
+            self._gc.registry.append(self._gc)
+        except BaseException:
+            self._stop_gc_step()
+
+    def _stop_gc_step(self) -> None:
+        try:
+            finalizer = self._gc_finalizer
+            if finalizer is None:
+                return
+            self._gc_finalizer = None
+            finalizer()
+            if (
+                max(self._gc.maximum) >= 0.1
+                and not self._engine.metadata.is_first_rank()
+            ):
+                logger.info(
+                    "[PREFILL_ASYNC_GC] step=%d rank=%s gc=%s",
+                    self._gc.step,
+                    getattr(self._engine.metadata, "worker_id", None),
+                    self._gc.stats(),
+                )
+        except BaseException:
+            pass  # Never replace the original transfer/fence/interrupt exception.
 
     def configure_window_limits(
         self, max_jobs: int, max_bytes: int, max_futures: int
@@ -103,6 +229,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             raise ValueError("Cannot change transfer limits during a bound step")
         self._limits = (max_jobs, max_bytes, max_futures)
 
+    @_gc_diagnostics(on_error_only=True)
     def bind_step(
         self,
         requests: list[LayerwisePrefillRequest],
@@ -125,6 +252,8 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             raise failure_type(
                 "Async backend is poisoned; restart worker"
             ) from self._failure_error
+        started = perf_counter()
+        self._start_gc_step()
         self._host_timings = {}
         # Include window_bind and the inherited direct bind ACK; the sync
         # backend resets its own row-only counters later during bind.
@@ -233,6 +362,9 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             ),
             error,
         )
+        # This host interval precedes the base bind's logged event=begin and
+        # elapsed clock. Expose it separately; do not add it to base elapsed.
+        self._record_host_time("window_bind", perf_counter() - started)
         try:
             super().bind_step(requests, kv_caches, validation_error=error)
         except Exception as exc:
@@ -273,6 +405,8 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         Per-phase triples are (calls, total_ms, max_ms). ACK times are nested in
         their enclosing callback scopes; publication also includes its save ACK.
         No duration here is an isolated NPU kernel or measured overlap interval.
+        GC arrays are process-local generations 0/1/2, with policy at step entry;
+        they overlap host scopes and do not prove GC caused a peer's ACK wait.
         """
         stats = self._queue.stats() if self._queue is not None else {}
         ack = self._engine.layerwise_prefill_ack_stats()
@@ -289,6 +423,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             "actual_jobs": self._device_jobs + self._remote_jobs,
             "device_jobs": self._device_jobs,
             "remote_jobs": self._remote_jobs,
+            "gc": self._gc.stats() if self._gc is not None else {},
             "async_host": {
                 phase: (count, round(total * 1000, 3), round(maximum * 1000, 3))
                 for phase, (count, total, maximum) in self._host_timings.items()
@@ -518,6 +653,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         )
         return self.finish_save(metadata, validation_error=validation_error)
 
+    @_gc_diagnostics()
     def finish_step(self) -> None:
         """Drain every device operation first, then validate and commit 79/22 rows."""
         error = self._timed_call("drain", self._drain_devices)
@@ -528,6 +664,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         self._rows.clear()
         self._bank_events.clear()
 
+    @_gc_diagnostics()
     def abort_step(self) -> None:
         """Drain, poison and retire the entire active batch on every TP rank.
 
@@ -849,21 +986,22 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         ends: list,
         direction: bool,
     ) -> Any:
-        prepare = self._engine.gpu_connector.prepare_layerwise_prefill_row
-        args = (
-            self._caches[key[0]],
-            [obj.tensor for obj in objects],
-            starts,
-            ends,
-            self._slots[req.request_id, key[4], key[2]],
-        )
-        if direction:
-            # Store preparation is included in prepare_save, including CPU
-            # allocation/pinning/key planning, rather than double-counted here.
-            return prepare(*args, kv_group=key[2], direction=True)
-        return self._timed_call(
-            "prepare_load", prepare, *args, kv_group=key[2], direction=False
-        )
+        started = perf_counter() if not direction else None
+        try:
+            return self._engine.gpu_connector.prepare_layerwise_prefill_row(
+                self._caches[key[0]],
+                [obj.tensor for obj in objects],
+                starts,
+                ends,
+                self._slots[req.request_id, key[4], key[2]],
+                kv_group=key[2],
+                direction=direction,
+            )
+        finally:
+            # Include CPU tensor-view acquisition, even when it fails. Stores
+            # already have one outer prepare_save scope covering all allocation.
+            if started is not None:
+                self._record_host_time("prepare_load", perf_counter() - started)
 
     def _enqueue_load(self, record: _AsyncRow) -> None:
         if record.load_submitted:
@@ -941,7 +1079,12 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             self._ack_seconds[phase] = (
                 self._ack_seconds.get(phase, 0.0) + perf_counter() - started
             )
+        if identity[0] == "commit":
+            # All transfer/commit work is done. Freeze before the base end record
+            # so logging allocations cannot change its GC snapshot afterwards.
+            self._stop_gc_step()
 
+    @_gc_diagnostics()
     def _fail_ack(self, failure: Exception) -> NoReturn:
         self._failed = self._poisoned = True
         cause = None
