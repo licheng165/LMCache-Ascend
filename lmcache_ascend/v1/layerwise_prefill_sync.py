@@ -68,6 +68,11 @@ class LayerwisePrefillSyncBackend:
     """
 
     supports_sync_callbacks = True
+
+    # Sync mode has no per-row gate after validate, so its acknowledgement
+    # must enter the collective at once. The async transfer window batches it
+    # into the row's load_ready gate instead.
+    _VALIDATE_ACK_FLUSH = True
     supports_transfer_window = False
     persists_indexer_group = True
     accepts_coordinator_validation_errors = True
@@ -366,9 +371,12 @@ class LayerwisePrefillSyncBackend:
     ) -> None:
         """Restore this row's full prefix on ALL TP ranks, including own chunks."""
         started = perf_counter()
-        group, row, bank, name = self._validate(
+        group, row, bank, name, failure = self._validate(
             metadata, "load", validation_error=validation_error
         )
+        if failure is not None:
+            # Flushing acknowledgements already raised on every rank.
+            raise failure
         if (group, row) in self._ready:
             self._load_seconds += perf_counter() - started
             return
@@ -464,9 +472,12 @@ class LayerwisePrefillSyncBackend:
         return. Layer-key mode also waits remote persistence here and returns None.
         """
         started = perf_counter()
-        group, row, bank, name = self._validate(
+        group, row, bank, name, failure = self._validate(
             metadata, "save", kv_layer, validation_error=validation_error
         )
+        if failure is not None:
+            # Flushing acknowledgements already raised on every rank.
+            raise failure
         root = self._engine.metadata.is_first_rank()
         for req in self._requests:
             identity = (req.request_id, req.allocation_generation, group, row)
@@ -778,16 +789,23 @@ class LayerwisePrefillSyncBackend:
         kv_layer: Any = None,
         *,
         validation_error: Exception | None = None,
-    ) -> tuple[int, int, int, str]:
+    ) -> tuple[int | None, int | None, int | None, str | None, Exception | None]:
+        """Return the validated row plus its captured error, never raise.
+
+        An error found before the row identity is derived leaves the row fields
+        None; flushing acknowledgements raise on every rank, while batched ones
+        rely on the caller reaching its gate with the failure, so _validate
+        must not escape through a half-initialized return.
+        """
         error = None
         key = None
         manifests = []
         ready = False
+        group = ordinal = bank = None
         try:
-            if validation_error is not None:
-                raise validation_error
-            if not self._bound or self._failed or not self._requests:
-                raise ValueError("Layerwise-prefill callback has no live bound step")
+            # Parse the row identity before any validation can fail: callers
+            # continue the callback's collective sequence (envelope broadcasts)
+            # even with a captured error, and need the derived row for that.
             row = metadata.row
             key = (
                 row.layer_name,
@@ -797,6 +815,16 @@ class LayerwisePrefillSyncBackend:
                 row.bank,
             )
             group, ordinal, bank = key[2:]
+        except Exception:
+            key = None
+            group = ordinal = bank = None
+        try:
+            if validation_error is not None:
+                raise validation_error
+            if not self._bound or self._failed or not self._requests:
+                raise ValueError("Layerwise-prefill callback has no live bound step")
+            if key is None:
+                raise ValueError("Layerwise-prefill callback row is unparseable")
             if (
                 any(type(value) is not int for value in key[1:])
                 or group not in (0, 1)
@@ -883,14 +911,24 @@ class LayerwisePrefillSyncBackend:
                         )
         except Exception as exc:
             error = exc
-        self._ack(("validate", phase, key, ready, tuple(manifests)), error)
-        return group, ordinal, bank, key[0]
+        # Sync mode has no later per-row gate: validate must flush at once.
+        # The async window overrides this to batch validate into load_ready.
+        self._ack(
+            ("validate", phase, key, ready, tuple(manifests)),
+            error,
+            flush=self._VALIDATE_ACK_FLUSH,
+        )
+        return group, ordinal, bank, None if key is None else key[0], error
 
-    def _ack(self, identity: tuple, error: Exception | None = None) -> None:
+    def _ack(
+        self, identity: tuple, error: Exception | None = None, *, flush: bool = True
+    ) -> None:
         started = perf_counter()
         phase = identity[1] if identity[0] == "validate" else identity[0]
         try:
-            self._engine.layerwise_prefill_ack((self._step, identity), error)
+            self._engine.layerwise_prefill_ack(
+                (self._step, identity), error, flush=flush
+            )
         except Exception as exc:
             self._failed = True
             if isinstance(exc, LayerwisePrefillFenceError):

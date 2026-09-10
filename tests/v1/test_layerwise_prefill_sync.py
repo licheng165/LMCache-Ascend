@@ -1510,10 +1510,10 @@ def test_delta_failure_preserves_old_manifest_and_releases_only_fresh_ownership(
     if failure == "passive_ack":
         ack = passive.layerwise_prefill_ack
 
-        def reject(identity: Any, error: Any = None) -> None:
+        def reject(identity: Any, error: Any = None, *, flush: bool = True) -> None:
             if identity[1][0] == "save":
                 error = ValueError("save acknowledgement failure")
-            ack(identity, error)
+            ack(identity, error, flush=flush)
 
         monkeypatch.setattr(passive, "layerwise_prefill_ack", reject)
     delayed = Future()

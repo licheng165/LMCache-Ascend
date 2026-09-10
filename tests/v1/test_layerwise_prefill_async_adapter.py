@@ -516,9 +516,11 @@ def _gloo_async_worker(
                 acknowledgements = []
                 acknowledge = engine.layerwise_prefill_ack
 
-                def ack(identity: Any, error: Any = None) -> None:
+                def ack(
+                    identity: Any, error: Any = None, *, flush: bool = True
+                ) -> None:
                     acknowledgements.append(identity)
-                    acknowledge(identity, error)
+                    acknowledge(identity, error, flush=flush)
 
                 monkeypatch.setattr(engine, "layerwise_prefill_ack", ack)
                 if rank == 1:

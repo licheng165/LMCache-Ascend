@@ -830,7 +830,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         }
 
     def layerwise_prefill_ack(
-        self, identity: Any, error: Optional[Exception] = None
+        self, identity: Any, error: Optional[Exception] = None, *, flush: bool = True
     ) -> None:
         """Acknowledge one synchronous phase on every TP CPU rank, or raise on all.
 
@@ -839,6 +839,21 @@ class AscendLMCacheEngine(LMCacheEngine):
         all-gather; every rank selects the object fallback from the same packets,
         regardless of its local phase/error/size. Mixed protocol builds are not
         supported. Call only on the model thread, outside graph capture.
+
+        ``flush=False`` appends the status to a pending batch instead of
+        entering a collective; the next flushing acknowledgement carries the
+        whole batch, so per-phase confirmation is preserved at flush
+        granularity while consecutive non-gating phases share one rendezvous.
+        Error statuses ride the batch too: row errors already reach every rank
+        symmetrically through the shared-handle envelope broadcast, and the
+        per-row gates (load_ready, source_done) plus the per-step gates flush
+        within one row callback, so a failure still raises on all ranks at the
+        same model-thread call. An immediate error flush would instead strand
+        healthy ranks: they run ahead into the envelope broadcast rendezvous
+        that the failing rank, blocked in an ACK collective, can never serve.
+        The model thread appends the same deterministic sequence on every rank,
+        and the flush compares complete batches, so any divergence still fails
+        on all ranks.
         """
         started = time.perf_counter()
         payload_bytes = fast_count = slow_count = 0
@@ -853,8 +868,26 @@ class AscendLMCacheEngine(LMCacheEngine):
                     None if error is None else f"{type(error).__name__}: {error}",
                     isinstance(error, LayerwisePrefillFenceError),
                 )
+                if world_size > 1 and not flush:
+                    pending = getattr(
+                        self, "_layerwise_prefill_ack_pending", None
+                    )
+                    if pending is None:
+                        pending = []
+                        self._layerwise_prefill_ack_pending = pending
+                    pending.append(status)
+                    return
+                batch = [status]
                 if world_size > 1:
-                    payload = pickle.dumps(status, protocol=pickle.HIGHEST_PROTOCOL)
+                    pending = getattr(
+                        self, "_layerwise_prefill_ack_pending", None
+                    )
+                    if pending:
+                        # Consume before serializing: a failed batch pickle is
+                        # replaced wholesale below, never re-sent half pickled.
+                        batch = pending + batch
+                        pending.clear()
+                    payload = pickle.dumps(batch, protocol=pickle.HIGHEST_PROTOCOL)
             except Exception as exc:
                 # An unpickleable identity (or broken exception __str__) must
                 # reach the peers as a plain error, never strand their ACK.
@@ -864,10 +897,10 @@ class AscendLMCacheEngine(LMCacheEngine):
                     f"ACK status serialization failed: {type(exc).__name__}",
                     isinstance(error, LayerwisePrefillFenceError),
                 )
+                batch = [status]
                 if world_size > 1:
-                    payload = pickle.dumps(status, protocol=pickle.HIGHEST_PROTOCOL)
+                    payload = pickle.dumps(batch, protocol=pickle.HIGHEST_PROTOCOL)
             payload_bytes = len(payload)
-            statuses = [status]
             if world_size > 1:
                 from vllm.distributed.parallel_state import get_tp_group
 
@@ -930,9 +963,9 @@ class AscendLMCacheEngine(LMCacheEngine):
                         torch.distributed.all_gather_object(
                             gathered_payloads, payload, group=group
                         )
-                        statuses = [pickle.loads(p) for p in gathered_payloads]
+                        batches = [pickle.loads(p) for p in gathered_payloads]
                     else:
-                        statuses = [
+                        batches = [
                             pickle.loads(peer[header.size : length])
                             for peer, length in zip(packets, lengths, strict=True)
                         ]
@@ -943,15 +976,32 @@ class AscendLMCacheEngine(LMCacheEngine):
                         "Layerwise-prefill TP acknowledgement failed; "
                         "peer device completion is unknown"
                     ) from exc
-            failures = [
-                (rank, "identity mismatch" if item[0] != identity else None, item[1])
-                for rank, item in enumerate(statuses)
-                if item[0] != identity or item[1] is not None
-            ]
+            else:
+                batches = [batch]
+            failures = []
+            for rank, item in enumerate(batches):
+                if item != batch:
+                    detail = None
+                    if isinstance(item, list):
+                        for entry in item:
+                            if isinstance(entry, tuple) and entry[1] is not None:
+                                detail = entry[1]
+                                break
+                    failures.append((rank, "identity mismatch", detail))
+                else:
+                    for entry in item:
+                        if entry[1] is not None:
+                            failures.append((rank, None, entry[1]))
+                            break
             if failures:
                 failure_type = (
                     LayerwisePrefillFenceError
-                    if any(item[2] for item in statuses)
+                    if any(
+                        entry[2]
+                        for item in batches
+                        if isinstance(item, list)
+                        for entry in item
+                    )
                     else ValueError
                 )
                 raise failure_type(

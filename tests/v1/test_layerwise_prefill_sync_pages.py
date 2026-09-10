@@ -399,10 +399,10 @@ def test_page_tp_commit_waits_and_failure_never_commits(
     if failure == "commit_ack":
         ack = passive.layerwise_prefill_ack
 
-        def reject(identity: Any, error: Any = None) -> None:
+        def reject(identity: Any, error: Any = None, *, flush: bool = True) -> None:
             if identity[1][0] == "commit":
                 error = ValueError("commit ACK failed")
-            ack(identity, error)
+            ack(identity, error, flush=flush)
 
         monkeypatch.setattr(passive, "layerwise_prefill_ack", reject)
     store.fail = failure == "remote"

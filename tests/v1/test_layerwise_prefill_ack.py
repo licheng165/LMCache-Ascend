@@ -127,10 +127,10 @@ def test_full_python_equality_not_pickle_bytes(ack_runtime: Any) -> None:
         stats = engine.layerwise_prefill_ack_stats()
         size = len(
             pickle.dumps(
-                (identities[rank], None, False), protocol=pickle.HIGHEST_PROTOCOL
+                [(identities[rank], None, False)], protocol=pickle.HIGHEST_PROTOCOL
             )
         )
-        assert stats["count"] == stats["fast_count"] == 2
+        assert stats["count"] == 2 and stats["fast_count"] == 2
         assert stats["slow_count"] == 0
         assert stats["serialized_bytes"] == 2 * size
         assert stats["max_payload_bytes"] == size < 4096
@@ -183,7 +183,7 @@ def test_capacity_includes_header(ack_runtime: Any, overflow: int) -> None:
     # Measure the fixed pickle overhead above the short-string encoding boundary.
     identity = (1, ("load", "x" * 300))
     overhead = (
-        len(pickle.dumps((identity, None, False), protocol=pickle.HIGHEST_PROTOCOL))
+        len(pickle.dumps([(identity, None, False)], protocol=pickle.HIGHEST_PROTOCOL))
         - 300
     )
     identity = (1, ("load", "x" * (4096 - 5 - overhead + overflow)))
@@ -193,6 +193,82 @@ def test_capacity_includes_header(ack_runtime: Any, overflow: int) -> None:
         assert stats["max_payload_bytes"] == 4091 + overflow
         assert stats["slow_count"] == overflow
         assert stats["fast_count"] == 1 - overflow
+
+
+def test_batched_acknowledgements_share_one_collective(ack_runtime: Any) -> None:
+    appends = [(1, ("validate", "load")), (1, ("prepare_load", "row"))]
+
+    def run(rank: int) -> None:
+        engine = ack_runtime.engines[rank]
+        for identity in appends:
+            engine.layerwise_prefill_ack(identity, flush=False)
+        engine.layerwise_prefill_ack((1, ("load_ready", "row")))
+
+    ack_runtime.runtime.parallel(lambda: run(0), lambda: run(1))
+    for engine in ack_runtime.engines:
+        stats = engine.layerwise_prefill_ack_stats()
+        assert stats["count"] == 3 and stats["fast_count"] == 1
+        assert stats["slow_count"] == 0
+        for phase in ("validate", "prepare_load"):
+            assert stats["by_phase"][phase]["count"] == 1
+            assert stats["by_phase"][phase]["fast_count"] == 0
+            assert stats["by_phase"][phase]["serialized_bytes"] == 0
+        ready = stats["by_phase"]["load_ready"]
+        assert ready["count"] == 1 and ready["fast_count"] == 1
+        assert 0 < ready["max_payload_bytes"] < 4091
+    assert all(c == Counter(all_gather=1) for c in ack_runtime.counts)
+
+
+def test_batched_sequence_divergence_fails_on_all_ranks(ack_runtime: Any) -> None:
+    def run(rank: int) -> None:
+        engine = ack_runtime.engines[rank]
+        engine.layerwise_prefill_ack((1, ("validate", "load")), flush=False)
+        if rank:
+            engine.layerwise_prefill_ack((1, ("prepare_load", "extra")), flush=False)
+        with pytest.raises(ValueError, match="identity mismatch"):
+            engine.layerwise_prefill_ack((1, ("load_ready",)))
+
+    ack_runtime.runtime.parallel(lambda: run(0), lambda: run(1))
+    assert all(c == Counter(all_gather=1) for c in ack_runtime.counts)
+
+
+def test_error_status_rides_the_next_flush(ack_runtime: Any) -> None:
+    def run(rank: int) -> None:
+        engine = ack_runtime.engines[rank]
+        engine.layerwise_prefill_ack((1, ("validate", "load")), flush=False)
+        engine.layerwise_prefill_ack(
+            (1, ("save", "row")),
+            ValueError("rank-one failure") if rank else None,
+            # Errors ride the batch: row errors already reach peers through the
+            # shared-handle envelope broadcast, and an immediate flush would
+            # strand healthy ranks at that broadcast rendezvous.
+            flush=False,
+        )
+        with pytest.raises(ValueError, match="rank-one failure|identity mismatch"):
+            engine.layerwise_prefill_ack((1, ("load_ready",)))
+
+    ack_runtime.runtime.parallel(lambda: run(0), lambda: run(1))
+    assert all(c == Counter(all_gather=1) for c in ack_runtime.counts)
+
+
+def test_batch_overflow_uses_object_fallback(ack_runtime: Any) -> None:
+    # Distinct payloads: pickle memoization would collapse identical strings.
+    bigs = [(1, ("validate", "load", "x" * 2500)), (1, ("prepare_load", "y" * 2500))]
+
+    def run(rank: int) -> None:
+        engine = ack_runtime.engines[rank]
+        for identity in bigs:
+            engine.layerwise_prefill_ack(identity, flush=False)
+        engine.layerwise_prefill_ack((1, ("load_ready",)))
+
+    ack_runtime.runtime.parallel(lambda: run(0), lambda: run(1))
+    for engine in ack_runtime.engines:
+        stats = engine.layerwise_prefill_ack_stats()
+        assert stats["count"] == 3 and stats["slow_count"] == 1
+        assert stats["max_payload_bytes"] > 4091
+    assert all(
+        c == Counter(all_gather=1, all_gather_object=1) for c in ack_runtime.counts
+    )
 
 
 def test_buffer_cache_tracks_group_and_world_without_tensor_item(
@@ -453,20 +529,28 @@ def test_actual_async_two_steps_packet_counts(
             assert stats["count"] == 712
             assert phases["bind"]["count"] == phases["window_bind"]["count"] == 1
             for phase in (
+                "validate",
                 "prepare_load",
                 "load_prepared",
-                "load_ready",
                 "prepare_save",
-                "source_done",
-                "save",
             ):
-                assert phases[phase]["max_payload_bytes"] < 4091
-                assert phases[phase]["slow_count"] == 0
+                # Non-gating phases ride the next flushing acknowledgement.
+                assert phases[phase]["count"] == 101
+                assert phases[phase]["fast_count"] == phases[phase]["slow_count"] == 0
+                assert phases[phase]["serialized_bytes"] == 0
+            assert phases["load_ready"]["count"] == 101
+            assert 0 < phases["load_ready"]["max_payload_bytes"] < 4091
+            assert phases["source_done"]["count"] == 101
+            assert phases["source_done"]["fast_count"] == 101
             assert phases["prepare_load"]["count"] == phases["save"]["count"] == 101
-            assert counts[rank]["all_gather"] == stats["count"]
-            assert counts[rank]["all_gather_object"] == stats["slow_count"]
-            assert stats["fast_count"] + stats["slow_count"] == stats["count"]
+            # The final source's save acknowledgement carries the row's batch.
+            assert phases["save"]["fast_count"] == 101
+            # window_bind/bind + load_ready/source_done/save x101 (per-row
+            # gates) + device_finish/finish/commit flushes.
+            assert counts[rank]["all_gather"] == stats["fast_count"] == 308
+            assert counts[rank]["all_gather_object"] == stats["slow_count"] == 0
             assert stats["count"] == sum(p["count"] for p in phases.values())
+            assert stats["count"] > stats["fast_count"] + stats["slow_count"]
 
 
 @pytest.mark.parametrize("failure", ["error", "serialization", "opposing_phase"])

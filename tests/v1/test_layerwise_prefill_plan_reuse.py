@@ -320,9 +320,9 @@ def test_real_saves_preserve_exact_acks_transfers_and_partial_overlap(
                 )
             return result
 
-        def ack(identity: Any, error: Any = None) -> None:
+        def ack(identity: Any, error: Any = None, *, flush: bool = True) -> None:
             acks.append(deepcopy(identity))
-            acknowledge(identity, error)
+            acknowledge(identity, error, flush=flush)
 
         monkeypatch.setattr(backend, "_plan", plan)
         monkeypatch.setattr(engine, "layerwise_prefill_ack", ack)

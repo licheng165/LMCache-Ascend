@@ -152,12 +152,14 @@ def test_window_bind_precedes_base_begin_and_elapsed_includes_validation_and_ack
             seen = True
         return validate(*args)
 
-    def acknowledge(identity: tuple, error: Any = None) -> None:
+    def acknowledge(
+        identity: tuple, error: Any = None, *, flush: bool = True
+    ) -> None:
         if isinstance(identity[1], tuple) and identity[1][0] == "window_bind":
             _collection(diagnostics.gc.callbacks, diagnostics.clock, 2, 0.25)
         elif identity[0] == "bind":
             diagnostics.clock[0] += 0.5
-        ack(identity, error)
+        ack(identity, error, flush=flush)
 
     monkeypatch.setattr(backend, "_callback_key", validate_callback)
     monkeypatch.setattr(engine, "layerwise_prefill_ack", acknowledge)
@@ -202,11 +204,13 @@ def test_bind_failure_detaches_even_raw_baseexception(
     else:
         ack = engine.layerwise_prefill_ack
 
-        def acknowledge(identity: tuple, error: Any = None) -> None:
+        def acknowledge(
+            identity: tuple, error: Any = None, *, flush: bool = True
+        ) -> None:
             phase = identity[1][0] if isinstance(identity[1], tuple) else identity[0]
             if phase == ("window_bind" if site == "window_ack" else "bind"):
                 fail()
-            ack(identity, error)
+            ack(identity, error, flush=flush)
 
         monkeypatch.setattr(engine, "layerwise_prefill_ack", acknowledge)
     with pytest.raises(error_type, match="bind sentinel") as caught:
@@ -611,7 +615,8 @@ def test_two_tp_steps_keep_712_acks_root_log_count_and_no_extra_device_work(
         assert not diagnostics.gc.callbacks
         assert diagnostics.logger.info.call_count == (step if slow_peer else 0)
         assert logger.info.call_count == 2 * step
-        assert gather.call_count == 2 * 712 * step
+        # 712 logical acknowledgements ride 308 flushing collectives per rank.
+        assert gather.call_count == 2 * 308 * step
         slow_calls += sum(
             engine.layerwise_prefill_ack_stats()["slow_count"] for engine in engines
         )

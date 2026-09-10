@@ -332,6 +332,7 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
             identity: Any,
             error: Any = None,
             *,
+            flush: bool = True,
             engine: Any = engine,
             backend: Any = backend,
             acknowledge: Any = acknowledge,
@@ -339,7 +340,7 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
             if isinstance(identity[1], tuple) and identity[1][0] == "window_bind":
                 assert backend._host_timings == {}
                 assert engine.layerwise_prefill_ack_stats()["count"] == 0
-            acknowledge(identity, error)
+            acknowledge(identity, error, flush=flush)
 
         monkeypatch.setattr(engine, "layerwise_prefill_ack", ack)
         for name in (
@@ -384,6 +385,11 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
     ack_calls = 101 * (4 + 3 * request_count) + 5
     assert sum(ack_counts.values()) == ack_calls
     assert request_count != 1 or ack_calls == 712
+    # Only gating phases enter a collective: per row load_ready, source_done
+    # and the final source's save, plus window_bind/bind/device_finish/finish/
+    # commit. Multi-request rows batch every earlier source into the last save.
+    ack_flushes = 101 * 3 + 5
+    assert request_count != 1 or ack_flushes == 308
 
     for step, (start, end) in enumerate(((0, 300), (300, 530)), start=1):
         requests = [
@@ -445,7 +451,7 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
                 phase: values[0] for phase, values in stats["ack"]["phase"].items()
             } == ack_counts
             assert ack_stats["count"] == ack_calls
-            assert ack_stats["fast_count"] + ack_stats["slow_count"] == ack_calls
+            assert ack_stats["fast_count"] + ack_stats["slow_count"] == ack_flushes
             assert ack_stats["serialized_bytes"] >= ack_stats["max_payload_bytes"] > 0
             slow_calls += ack_stats["slow_count"]
             assert resets[rank].call_count == step
@@ -464,7 +470,7 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
             changed["ack"]["phase"].clear()
             changed["ack"]["calls"] = -1
             assert backend.window_stats() == stats
-        assert tensor_gather.call_count == 2 * ack_calls * step
+        assert tensor_gather.call_count == 2 * ack_flushes * step
         assert object_gather.call_count == slow_calls
         assert all(sync.call_count == step for sync in stream_syncs)
         assert len(logger.method_calls) == len(logged) == 2 * step
@@ -1269,11 +1275,12 @@ def test_abort_meets_finish_ack_drains_lookahead_once_before_any_release(
             identity: Any,
             error: Any = None,
             *,
+            flush: bool = True,
             rank: int = rank,
             acknowledge: Any = acknowledge,
         ) -> None:
             acknowledgements[rank].append(identity)
-            acknowledge(identity, error)
+            acknowledge(identity, error, flush=flush)
 
         monkeypatch.setattr(engine, "layerwise_prefill_ack", ack)
     entered, gate = Event(), Event()
@@ -1376,7 +1383,9 @@ def test_broken_initial_ack_never_attempts_failure_or_abort_collective(
     acknowledgements = []
     for engine in engines:
 
-        def broken(identity: Any, error: Any = None) -> None:
+        def broken(
+            identity: Any, error: Any = None, *, flush: bool = True
+        ) -> None:
             acknowledgements.append(identity)
             raise LayerwisePrefillFenceError("broken collective sentinel")
 
@@ -1544,13 +1553,13 @@ def test_warm_load_uses_retained_lists_and_constant_size_ack(
         assert end == req.compute_end, "Warm load rebuilt the retained key plan"
         return plan(req, end, group, row)
 
-    def compact_ack(identity: Any, error: Any = None) -> None:
+    def compact_ack(identity: Any, error: Any = None, *, flush: bool = True) -> None:
         if isinstance(identity[1], tuple) and identity[1][0] == "prepare_load":
             summary = identity[1][-1]
             assert summary == (True, 1, 300, 2, 11)
             assert len(pickle.dumps(identity)) < 160
             summaries.append(summary)
-        acknowledge(identity, error)
+        acknowledge(identity, error, flush=flush)
 
     monkeypatch.setattr(backend, "_plan", save_plan)
     monkeypatch.setattr(engine, "layerwise_prefill_ack", compact_ack)
