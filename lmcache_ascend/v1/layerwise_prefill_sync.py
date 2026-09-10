@@ -69,10 +69,10 @@ class LayerwisePrefillSyncBackend:
 
     supports_sync_callbacks = True
 
-    # Sync mode has no per-row gate after validate, so its acknowledgement
-    # must enter the collective at once. The async transfer window batches it
-    # into the row's load_ready gate instead.
-    _VALIDATE_ACK_FLUSH = True
+    # Sync mode keeps its per-phase flushing acknowledgement; the async
+    # transfer window (Plan A) performs no per-row acknowledgements at all and
+    # relies on local raises plus the shared-handle error envelopes.
+    _VALIDATE_ACK_ENABLED = True
     supports_transfer_window = False
     persists_indexer_group = True
     accepts_coordinator_validation_errors = True
@@ -793,9 +793,10 @@ class LayerwisePrefillSyncBackend:
         """Return the validated row plus its captured error, never raise.
 
         An error found before the row identity is derived leaves the row fields
-        None; flushing acknowledgements raise on every rank, while batched ones
-        rely on the caller reaching its gate with the failure, so _validate
-        must not escape through a half-initialized return.
+        None. Callers continue the callback's envelope-broadcast sequence with
+        the captured failure (or raise it after that sequence when there is no
+        row to follow), so _validate must not escape through a half-initialized
+        return.
         """
         error = None
         key = None
@@ -911,13 +912,11 @@ class LayerwisePrefillSyncBackend:
                         )
         except Exception as exc:
             error = exc
-        # Sync mode has no later per-row gate: validate must flush at once.
-        # The async window overrides this to batch validate into load_ready.
-        self._ack(
-            ("validate", phase, key, ready, tuple(manifests)),
-            error,
-            flush=self._VALIDATE_ACK_FLUSH,
-        )
+        if self._VALIDATE_ACK_ENABLED:
+            self._ack(
+                ("validate", phase, key, ready, tuple(manifests)),
+                error,
+            )
         return group, ordinal, bank, None if key is None else key[0], error
 
     def _ack(

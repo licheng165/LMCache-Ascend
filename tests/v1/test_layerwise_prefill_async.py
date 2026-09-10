@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 import ast
-import pickle
 
 # Third Party
 from lmcache.v1.storage_backend.required_put_queue import RequiredPutQueue
@@ -307,8 +306,8 @@ def test_async_host_timing_scopes_include_save_preparation_and_publication_ack(
         "wait_load": (101, 404.0, 4.0),
         "complete_load": (101, 808.0, 8.0),
         "complete_save": (101, 808.0, 8.0),
-        # Publication includes resolve + save ACK, but not source_done ACK.
-        "publish": (101, 4848.0, 48.0),
+        # Publication times resolve only; Plan A removed the per-row save ACK.
+        "publish": (101, 1616.0, 16.0),
         "drain": (1, 112.0, 112.0),
         "remote_submit": (2, 256.0, 128.0),
         "remote_drain": (1, 256.0, 256.0),
@@ -371,25 +370,14 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
     ack_counts = {
         "window_bind": 1,
         "bind": 1,
-        "validate": 101,
-        "prepare_load": 101 * request_count,
-        "load_prepared": 101 * request_count,
-        "prepare_save": 101,
-        "load_ready": 101,
-        "source_done": 101,
-        "save": 101 * request_count,
         "device_finish": 1,
         "finish": 1,
         "commit": 1,
     }
-    ack_calls = 101 * (4 + 3 * request_count) + 5
+    ack_calls = 5
     assert sum(ack_counts.values()) == ack_calls
-    assert request_count != 1 or ack_calls == 712
-    # Only gating phases enter a collective: per row load_ready, source_done
-    # and the final source's save, plus window_bind/bind/device_finish/finish/
-    # commit. Multi-request rows batch every earlier source into the last save.
-    ack_flushes = 101 * 3 + 5
-    assert request_count != 1 or ack_flushes == 308
+    # Plan A: only the five per-step gates enter a collective; rows issue none.
+    ack_flushes = 5
 
     for step, (start, end) in enumerate(((0, 300), (300, 530)), start=1):
         requests = [
@@ -692,7 +680,7 @@ def test_errors_deferred_until_post_hcom_all_tp(
         hcom.set()  # Reached model HCOM despite local enqueue/identity failure.
         error = (
             ValueError("coordinator finish identity")
-            if rank == 0 and failure == "finish_identity"
+            if failure == "finish_identity"
             else None
         )
         with pytest.raises(ValueError, match="native|identity|duplicated"):
@@ -832,54 +820,44 @@ def test_real_prepare_failure_or_abort_before_finish_releases_only_after_drain(
 
 
 @pytest.mark.parametrize("at_abort", [False, True])
-def test_unknown_fence_quarantines_every_rank_and_all_step_owners(
+def test_unknown_fence_quarantines_local_step_and_owners(
     page_runtime: Any, at_abort: bool
 ) -> None:
-    engines = [page_runtime.engine(size=2)]
-    engines.append(page_runtime.engine(1, engines[0], size=2))
-    backends = []
-    for rank, engine in enumerate(engines):
-        page_runtime.thread.rank = rank
-        backends.append(_backend(engine))
-    page_runtime.parallel(
-        lambda: _execute(engines[0], backends[0], [_request()]),
-        lambda: _execute(engines[1], backends[1], [_request()]),
-    )
+    # Plan A: an unknown device fence poisons this rank only; peers learn via
+    # the engine's worker failure handling, not a TP agreement collective.
+    engine = page_runtime.engine()
+    backend = _backend(engine)
+    _execute(engine, backend, [_request()])
     requests = [_request(start=300, end=530, generation=2)]
 
-    def run(rank: int) -> None:
-        engine, backend = engines[rank], backends[rank]
-        metadata = _bind(engine, backend, requests)[0]
-        backend.wait_for_load(metadata)
-        backend.submit_save(metadata, _registry(engine)[metadata.row.layer_name])
-        engine.gpu_connector.fence_error = rank == 1
-        if not at_abort:
-            with pytest.raises(LayerwisePrefillFenceError, match="unknown"):
-                backend.finish_save(metadata)
-        with pytest.raises(LayerwisePrefillFenceError, match="Cannot release"):
-            backend.abort_request("req-0")
-        assert backend._unsafe_transfer
-        assert backend._prefixes and backend._rows
-        assert all(
-            obj.is_valid() and obj.metadata.pin_count == 1
-            for prefix in backend._prefixes.values()
-            for obj in prefix.objects
-        )
-
-    page_runtime.parallel(lambda: run(0), lambda: run(1))
-    allocator = engines[0].storage_manager.local_cpu_backend.memory_allocator
+    metadata = _bind(engine, backend, requests)[0]
+    backend.wait_for_load(metadata)
+    backend.submit_save(metadata, _registry(engine)[metadata.row.layer_name])
+    engine.gpu_connector.fence_error = True
+    if not at_abort:
+        with pytest.raises(LayerwisePrefillFenceError, match="unknown"):
+            backend.finish_save(metadata)
+    with pytest.raises(LayerwisePrefillFenceError, match="Cannot release"):
+        backend.abort_request("req-0")
+    assert backend._unsafe_transfer
+    assert backend._prefixes and backend._rows
+    assert all(
+        obj.is_valid() and obj.metadata.pin_count == 1
+        for prefix in backend._prefixes.values()
+        for obj in prefix.objects
+    )
+    allocator = engine.storage_manager.local_cpu_backend.memory_allocator
     assert allocator.num_active_allocations == 204
-    for source in backends[0]._rows[0, 0].sources:
+    for source in backend._rows[0, 0].sources:
         assert all(
             obj.is_valid() and obj.metadata.pin_count == 1 for obj in source.fresh
         )
     # CPU-only teardown simulates process exit; production has no recovery API.
-    for engine, backend in zip(engines, backends, strict=True):
-        engine.gpu_connector.fence_error = False
-        engine.gpu_connector.drain_layerwise_prefill_transfers()
-        backend._unsafe_transfer = False
-        backend._abort_drained = True
-        backend.abort_request("req-0")
+    engine.gpu_connector.fence_error = False
+    engine.gpu_connector.drain_layerwise_prefill_transfers()
+    backend._unsafe_transfer = False
+    backend._abort_drained = True
+    backend.abort_request("req-0")
 
 
 def test_stale_generation_finish_preserves_current_record(page_runtime: Any) -> None:
@@ -955,33 +933,26 @@ def test_final_remote_ack_completes_all_tp_only_after_queue_close(
         )
 
 
-@pytest.mark.parametrize(
-    "failure,bad_rank",
-    [("plan", 0), ("plan", 1), ("prepare", 0), ("prepare", 1), ("allocate", 0)],
-)
-def test_row_preparation_errors_ack_all_ranks_before_sfa(
-    page_runtime: Any, monkeypatch: Any, failure: str, bad_rank: int
+@pytest.mark.parametrize("failure", ["plan", "prepare", "allocate"])
+def test_row_preparation_errors_raise_locally_before_sfa(
+    page_runtime: Any, monkeypatch: Any, failure: str
 ) -> None:
-    engines = [page_runtime.engine(size=2)]
-    engines.append(page_runtime.engine(1, engines[0], size=2))
-    backends = []
-    for rank, engine in enumerate(engines):
-        page_runtime.thread.rank = rank
-        backends.append(_backend(engine))
+    engine = page_runtime.engine()
+    backend = _backend(engine)
     if failure == "plan":
         monkeypatch.setattr(
-            backends[bad_rank],
+            backend,
             "_plan",
             Mock(side_effect=RuntimeError("prepare plan failed")),
         )
     elif failure == "prepare":
         monkeypatch.setattr(
-            engines[bad_rank].gpu_connector,
+            engine.gpu_connector,
             "prepare_layerwise_prefill_row",
             Mock(side_effect=RuntimeError("prepare native failed")),
         )
     else:
-        manager = engines[0].storage_manager
+        manager = engine.storage_manager
         allocate = manager.allocate
         count = 0
 
@@ -992,22 +963,46 @@ def test_row_preparation_errors_ack_all_ranks_before_sfa(
 
         monkeypatch.setattr(manager, "allocate", partial)
 
+    requests = [_request()]
+    metadata = _bind(engine, backend, requests)[0]
+    # Plan A: the row error surfaces as a local ValueError before SFA; no
+    # TP agreement collective is entered on the row path.
+    with pytest.raises(ValueError, match="prepare|allocation"):
+        backend.wait_for_load(metadata)
+    assert not engine.gpu_connector.calls
+    backend.abort_request("req-0")
+    assert (
+        engine.storage_manager.local_cpu_backend.memory_allocator.num_active_allocations
+        == 0
+    )
+
+
+def test_root_row_preparation_error_reaches_passive_ranks_via_envelope(
+    page_runtime: Any, monkeypatch: Any
+) -> None:
+    engines = [page_runtime.engine(size=2)]
+    engines.append(page_runtime.engine(1, engines[0], size=2))
+    backends = []
+    for rank, engine in enumerate(engines):
+        page_runtime.thread.rank = rank
+        backends.append(_backend(engine))
+    monkeypatch.setattr(
+        engines[0],
+        "resolve_layerwise_prefill_group",
+        Mock(side_effect=RuntimeError("prepare plan failed")),
+    )
+
     def run(rank: int) -> None:
         engine, backend = engines[rank], backends[rank]
-        requests = [_request()]
-        metadata = _bind(engine, backend, requests)[0]
-        with pytest.raises(ValueError, match="prepare|allocation"):
+        metadata = _bind(engine, backend, [_request()])[0]
+        # The root's error envelope reaches the passive rank through the same
+        # shared-handle broadcast the row would have used.
+        with pytest.raises(ValueError, match="prepare plan failed"):
             backend.wait_for_load(metadata)
-        assert not engine.gpu_connector.calls
         backend.abort_request("req-0")
 
     page_runtime.parallel(lambda: run(0), lambda: run(1))
-    assert (
-        engines[
-            0
-        ].storage_manager.local_cpu_backend.memory_allocator.num_active_allocations
-        == 0
-    )
+    assert not engines[0].gpu_connector.calls and not engines[1].gpu_connector.calls
 
 
 def test_default_64mib_batches_two_latent_pages_by_actual_object_bytes(
@@ -1168,45 +1163,34 @@ def test_callback_aliases_require_the_same_object(page_runtime: Any) -> None:
 def test_previous_step_same_generation_callback_never_consumes_current_row(
     page_runtime: Any, phase: str
 ) -> None:
-    engines, backends = _tp_backends(page_runtime)
-    old = [_callbacks([_request()]) for _ in engines]
-    page_runtime.parallel(
-        *[
-            lambda rank=rank: _execute(
-                engines[rank], backends[rank], [_request()], callbacks=old[rank]
-            )
-            for rank in (0, 1)
-        ]
-    )
+    # Plan A: stale-callback rejection is a purely local check; the offending
+    # rank raises inside its own callback without any TP agreement collective.
+    engine = page_runtime.engine()
+    backend = _backend(engine)
+    old = _callbacks([_request()])
+    _execute(engine, backend, [_request()], callbacks=old)
     req = _request(start=300, end=530)  # Same allocation generation, different step.
 
-    def run(rank: int) -> None:
-        engine, backend = engines[rank], backends[rank]
-        current = _bind(engine, backend, [req])[0]
-        assert current == old[rank][0] and current is not old[rank][0]
-        assert backend._previous_callbacks[0] is old[rank][0]
-        if phase == "wait":
-            with pytest.raises(ValueError, match="registered|identity mismatch"):
-                backend.wait_for_load(old[rank][0] if rank == 1 else current)
-        else:
-            backend.wait_for_load(current)
-            record = backend._rows[0, 0]
-            _compute(engine, [req], current)
-            backend.submit_save(
-                old[rank][0] if rank == 1 and phase == "submit" else current,
-                _registry(engine)[current.row.layer_name],
-            )
-            with pytest.raises(ValueError, match="registered|identity mismatch"):
-                backend.finish_save(
-                    old[rank][0] if rank == 1 and phase == "finish" else current
-                )
-            assert backend._rows[0, 0] is record and not record.finished
-            assert all(obj.is_valid() for obj in record.sources[0].fresh)
-        assert backend._saved == [0, 0]
-        assert backend._abort_drained
-        backend.abort_step()  # No repeated ACK after the common failure handshake.
-
-    page_runtime.parallel(lambda: run(0), lambda: run(1))
+    current = _bind(engine, backend, [req])[0]
+    assert current == old[0] and current is not old[0]
+    assert backend._previous_callbacks[0] is old[0]
+    if phase == "wait":
+        with pytest.raises(ValueError, match="registered"):
+            backend.wait_for_load(old[0])
+    else:
+        backend.wait_for_load(current)
+        record = backend._rows[0, 0]
+        _compute(engine, [req], current)
+        backend.submit_save(
+            old[0] if phase == "submit" else current,
+            _registry(engine)[current.row.layer_name],
+        )
+        with pytest.raises(ValueError, match="registered"):
+            backend.finish_save(old[0] if phase == "finish" else current)
+        assert backend._rows[0, 0] is record and not record.finished
+        assert all(obj.is_valid() for obj in record.sources[0].fresh)
+    assert backend._saved == [0, 0]
+    backend.abort_request("req-0")
 
 
 def test_reused_callback_object_rejected_at_next_bind_all_tp(page_runtime: Any) -> None:
@@ -1267,34 +1251,12 @@ def test_abort_meets_finish_ack_drains_lookahead_once_before_any_release(
         )
         for engine in engines
     )
-    acknowledgements = [[], []]
-    for rank, engine in enumerate(engines):
-        acknowledge = engine.layerwise_prefill_ack
-
-        def ack(
-            identity: Any,
-            error: Any = None,
-            *,
-            flush: bool = True,
-            rank: int = rank,
-            acknowledge: Any = acknowledge,
-        ) -> None:
-            acknowledgements[rank].append(identity)
-            acknowledge(identity, error, flush=flush)
-
-        monkeypatch.setattr(engine, "layerwise_prefill_ack", ack)
-    entered, gate = Event(), Event()
-    drain = engines[1].gpu_connector.drain_layerwise_prefill_transfers
-
-    def delayed_drain() -> None:
-        entered.set()
-        assert gate.wait(10)
-        engines[1].gpu_connector.fence_error = unsafe
-        drain()
-
-    monkeypatch.setattr(
-        engines[1].gpu_connector, "drain_layerwise_prefill_transfers", delayed_drain
-    )
+    for engine in engines:
+        engine.gpu_connector.fence_error = unsafe
+    drains = [
+        sum(1 for event in engine.gpu_connector.events if event[0] == "drain")
+        for engine in engines
+    ]
     released = []
     for backend in backends:
         release = backend._release
@@ -1303,8 +1265,8 @@ def test_abort_meets_finish_ack_drains_lookahead_once_before_any_release(
             objects: list, *, release: Any = release, backend: Any = backend
         ) -> None:
             assert not unsafe
-            # Peers may not yet have returned from the completed collective to
-            # update their Python flags; their actual device work is all fenced.
+            # Ownership is only released after this rank's abort drain agreed
+            # with every peer; all submitted device work is fenced by then.
             assert backend._abort_drained
             assert all(
                 t.complete
@@ -1317,33 +1279,20 @@ def test_abort_meets_finish_ack_drains_lookahead_once_before_any_release(
 
         monkeypatch.setattr(backend, "_release", release_after_drain)
 
-    def abort() -> None:
-        with pytest.raises(
-            LayerwisePrefillFenceError if unsafe else ValueError,
-            match="Cannot release" if unsafe else "identity mismatch",
-        ):
-            backends[0].abort_step()
+    def abort(rank: int) -> None:
+        if unsafe:
+            with pytest.raises(LayerwisePrefillFenceError, match="Cannot release"):
+                backends[rank].abort_request("req-0")
+        else:
+            backends[rank].abort_request("req-0")
 
-    def finish() -> None:
-        with pytest.raises(
-            LayerwisePrefillFenceError if unsafe else ValueError,
-            match="unknown" if unsafe else "identity mismatch",
-        ):
-            backends[1].finish_save(callbacks[1][0])
-        if not unsafe:
-            backends[1].abort_step()
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        completed = pool.submit(page_runtime.parallel, abort, finish)
-        assert entered.wait(5)
-        assert not completed.done() and not released
-        assert all(not b._step_future.done() for b in backends)
-        gate.set()
-        completed.result(15)
-    assert all(
-        len(acks) == 2 and acks[1] == ("failed_step_drained", 2)
-        for acks in acknowledgements
-    )
+    assert all(not b._step_future.done() for b in backends)
+    page_runtime.parallel(lambda: abort(0), lambda: abort(1))
+    # Exactly one abort drain per rank (the unknown-fence probe drains twice);
+    # nothing is released before it.
+    for engine, before in zip(engines, drains, strict=True):
+        after = sum(1 for event in engine.gpu_connector.events if event[0] == "drain")
+        assert after == before + (2 if unsafe else 1)
     if unsafe:
         for backend in backends:
             with pytest.raises(LayerwisePrefillFenceError, match="Cannot release"):
@@ -1351,9 +1300,8 @@ def test_abort_meets_finish_ack_drains_lookahead_once_before_any_release(
         assert not released and all(
             b._unsafe_transfer and not b._abort_drained for b in backends
         )
-        monkeypatch.setattr(
-            engines[1].gpu_connector, "drain_layerwise_prefill_transfers", drain
-        )
+        for engine in engines:
+            engine.gpu_connector.fence_error = False
         for backend in backends:
             monkeypatch.setattr(
                 backend, "_release", LayerwisePrefillAsyncBackend._release
@@ -1361,7 +1309,6 @@ def test_abort_meets_finish_ack_drains_lookahead_once_before_any_release(
         _dispose_cpu_quarantine(engines, backends)
     else:
         assert released and all(not b._bound and not b._history for b in backends)
-    assert all(len(acks) == 2 for acks in acknowledgements)
 
 
 def test_broken_initial_ack_never_attempts_failure_or_abort_collective(
@@ -1393,8 +1340,9 @@ def test_broken_initial_ack_never_attempts_failure_or_abort_collective(
 
     def run(rank: int) -> None:
         backend = backends[rank]
-        with pytest.raises(LayerwisePrefillFenceError, match="broken collective"):
-            backend.finish_save(callbacks[rank][0])
+        # Plan A: row callbacks enter no collective; finish_save completes and
+        # the broken collective first fires inside abort_step.
+        backend.finish_save(callbacks[rank][0])
         for _ in range(2):
             with pytest.raises(LayerwisePrefillFenceError, match="Cannot release"):
                 backend.abort_step()
@@ -1522,10 +1470,13 @@ def test_storage_baseexception_is_normalized_drained_and_acknowledged_all_tp(
                 backend.finish_save(callbacks[rank])
             else:
                 backend.finish_step()
+        # Plan A: the local raise performs no drain; abort_request does.
+        backend.abort_request("req-0")
         assert backend._abort_drained and not backend._unsafe_transfer
         assert backend.pending_futures() == 0
-        assert interruption.__name__ in str(backend._step_future.exception())
-        backend.abort_step()
+        # The interruption already surfaced at finish_save; the step future
+        # carries the generic abort failure.
+        assert backend._step_future.done()
 
     page_runtime.parallel(lambda: run(0), lambda: run(1))
     if stage != "local_put":
@@ -1539,29 +1490,33 @@ def test_storage_baseexception_is_normalized_drained_and_acknowledged_all_tp(
     )
 
 
-def test_warm_load_uses_retained_lists_and_constant_size_ack(
+def test_warm_load_uses_retained_lists_without_row_acknowledgements(
     page_runtime: Any, monkeypatch: Any
 ) -> None:
     engine = page_runtime.engine()
     backend = _backend(engine)
     _execute(engine, backend, [_request()])
     plan = backend._plan
-    acknowledge = engine.layerwise_prefill_ack
-    summaries = []
+    load_rebuilds = []
 
     def save_plan(req: Any, end: int, group: int, row: int) -> Any:
-        assert end == req.compute_end, "Warm load rebuilt the retained key plan"
+        if end != req.compute_end:
+            load_rebuilds.append(end)
         return plan(req, end, group, row)
 
-    def compact_ack(identity: Any, error: Any = None, *, flush: bool = True) -> None:
-        if isinstance(identity[1], tuple) and identity[1][0] == "prepare_load":
-            summary = identity[1][-1]
-            assert summary == (True, 1, 300, 2, 11)
-            assert len(pickle.dumps(identity)) < 160
-            summaries.append(summary)
-        acknowledge(identity, error, flush=flush)
-
     monkeypatch.setattr(backend, "_plan", save_plan)
-    monkeypatch.setattr(engine, "layerwise_prefill_ack", compact_ack)
     _execute(engine, backend, [_request(start=300, end=530)])
-    assert len(summaries) == 101
+    assert not load_rebuilds
+    assert backend._reused_rows == 101
+    stats = engine.layerwise_prefill_ack_stats()
+    # Plan A: warm rows issue no acknowledgements; only the per-step gates
+    # (single-rank worlds enter no collective at all).
+    assert stats["count"] == 5
+    assert stats["fast_count"] == stats["slow_count"] == 0
+    assert set(stats["by_phase"]) == {
+        "window_bind",
+        "bind",
+        "device_finish",
+        "finish",
+        "commit",
+    }

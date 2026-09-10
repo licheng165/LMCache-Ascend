@@ -570,7 +570,7 @@ def test_disabled_gc_manual_collections_preserve_global_policy_and_callbacks(
 
 
 @pytest.mark.parametrize("slow_peer", [False, True])
-def test_two_tp_steps_keep_712_acks_root_log_count_and_no_extra_device_work(
+def test_two_tp_steps_keep_five_gate_acks_root_log_count_and_no_extra_device_work(
     page_runtime: Any, diagnostics: Any, monkeypatch: Any, slow_peer: bool
 ) -> None:
     engines, backends = _tp_backends(page_runtime)
@@ -615,15 +615,15 @@ def test_two_tp_steps_keep_712_acks_root_log_count_and_no_extra_device_work(
         assert not diagnostics.gc.callbacks
         assert diagnostics.logger.info.call_count == (step if slow_peer else 0)
         assert logger.info.call_count == 2 * step
-        # 712 logical acknowledgements ride 308 flushing collectives per rank.
-        assert gather.call_count == 2 * 308 * step
+        # Plan A: five per-step gate collectives per rank; rows issue none.
+        assert gather.call_count == 2 * 5 * step
         slow_calls += sum(
             engine.layerwise_prefill_ack_stats()["slow_count"] for engine in engines
         )
         assert object_gather.call_count == slow_calls
         assert all(sync.call_count == step for sync in stream_syncs)
         for rank, backend in enumerate(backends):
-            assert backend.window_stats()["ack"]["calls"] == 712
+            assert backend.window_stats()["ack"]["calls"] == 5
             assert backend.window_stats()["gc"]["counts"] == (
                 0,
                 0,

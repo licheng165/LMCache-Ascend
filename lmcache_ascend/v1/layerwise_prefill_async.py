@@ -152,23 +152,18 @@ class _AsyncRow:
 class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
     """Transfer-window backend; validated rows publish and restore in flight.
 
-    Non-gating row acknowledgements (validate, prepare_load, load_prepared,
-    prepare_save, and every source's save but the last) ride the next flushing
-    acknowledgement. Flushing gates are load_ready within wait_for_load,
-    source_done before finish_save's publication, the final source's save after
-    publication, and device_finish/finish/commit per step. Both per-row
-    callback gates flush, so a failure on any rank still surfaces on every rank
-    at the same model-thread call. Error statuses ride batches like any other:
-    a callback never exits its collective sequence early, because peers still
-    run that row's envelope broadcasts (which also carry root errors
-    symmetrically) and a stranded broadcast rendezvous cannot be served by a
-    rank blocked in an ACK collective. The pre-publication source_done gate is
-    what a concurrently aborting peer pairs with, instead of deadlocking this
-    rank inside publication.
+    Plan A lightweight error model: NO per-row acknowledgements. Only the five
+    per-step gates (window_bind, bind, device_finish, finish, commit) enter
+    CPU collectives. Row-path failures surface locally: validation and
+    preparation errors raise at the end of their callback on this rank, root
+    publication errors ride the shared-handle error envelopes (received
+    symmetrically by passive ranks), and a rank that raises mid-callback is
+    rescued by the usual vLLM worker exception propagation instead of a TP
+    agreement collective. This restores the original layerwise_prefill_cache
+    branch's error weight: zero CPU collectives per row.
     """
 
-    # The load_ready gate confirms the batched validate within wait_for_load.
-    _VALIDATE_ACK_FLUSH = False
+    _VALIDATE_ACK_ENABLED = False
     """Actual async row backend; all device and storage work ends within a step.
 
     Call configure_window_limits on all ranks before bind_step. Row entry calls
@@ -467,6 +462,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             },
         }
 
+    @_gc_diagnostics(on_error_only=True)
     def wait_for_load(
         self, metadata: Any, *, validation_error: Exception | None = None
     ) -> None:
@@ -486,26 +482,29 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         )
         current = None
         error = failure
+        if failure is not None:
+            # Keep the validation failure as the pending root cause while the
+            # row's broadcast sequence still runs below.
+            self._pending_error = self._pending_error or failure
         if group is not None:
-            # Continue the callback's collective sequence even on validation
-            # failure: peers still run this row's envelope broadcasts, and the
-            # batched validate error surfaces at the load_ready gate below.
+            # Follow the row's envelope-broadcast sequence even on validation
+            # failure (passive peers still receive this row's handles); the
+            # captured failure raises locally at the end of this callback.
             current = self._prepare_load(group, row)
             error = None
             try:
                 if current.consumed:
                     raise ValueError("Duplicate async row entry")
-                self._timed_call("prepare_save", self._prepare_save, current)
+                if self._pending_error is None:
+                    self._timed_call("prepare_save", self._prepare_save, current)
             except Exception as exc:
                 error = exc
-            # Non-gating row phases ride the next flushing acknowledgement (the
-            # load_ready gate below for prepare_save); see layerwise_prefill_ack.
-            self._prepared_ack(("prepare_save", group, row), error, flush=False)
+            # The lookahead always runs, even with a captured error: peers
+            # still receive this row's envelope broadcasts in the same order.
             if row + 1 < self.layer_count(group):
                 self._prepare_load(group, row + 1)
-            error = None
             try:
-                if not current.load_submitted:
+                if self._pending_error is None and not current.load_submitted:
                     self._enqueue_load(current)
                 for ticket in current.loads:
                     self._timed_call(
@@ -514,17 +513,16 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                         ticket,
                     )
             except Exception as exc:
-                error = exc
-        # The load_ready gate always flushes. With an unparseable row (no
-        # collective sequence to follow) it must still run before raising so
-        # peers waiting at their own gate are never stranded.
-        self._prepared_ack(
-            ("load_ready", None if current is None else current.identity), error
-        )
-        if current is not None:
+                error = error or exc
             current.consumed = True
             self._ready.add((group, row))
         self._load_seconds += perf_counter() - started
+        # Plan A: no per-row acknowledgement; load-path failures raise locally
+        # once this rank's broadcast sequence is complete. The pending error is
+        # the root cause; later noisier failures must not mask it.
+        failure = self._pending_error or error
+        if failure is not None:
+            raise self._callback_failure(failure)
 
     def submit_save(
         self,
@@ -589,6 +587,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         except Exception as exc:
             self._pending_error = self._pending_error or exc
 
+    @_gc_diagnostics(on_error_only=True)
     def finish_save(
         self, metadata: Any, *, validation_error: Exception | None = None
     ) -> Future:
@@ -620,23 +619,19 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             drained = self._drain_devices()
             if isinstance(drained, LayerwisePrefillFenceError):
                 error = drained
-        # source_done gates BEFORE publication: it is the first collective of
-        # this callback, so a peer aborting concurrently pairs here (common
-        # failure-drain handshake) instead of stranding this rank inside a
-        # publication envelope broadcast. Its flush raises on every rank
-        # before any row content can be published.
-        self._ack(
-            ("source_done", None if record is None else record.identity), error
-        )
+        # Plan A: no source_done gate and no save acknowledgements. Publication
+        # continues with the captured error carried into the envelope (root
+        # error envelopes reach passive ranks symmetrically), and the failure
+        # raises locally at the end of this callback.
+        failure = error
         publication_started = perf_counter()
         root = self._engine.metadata.is_first_rank()
-        last = len(record.sources) - 1 if record is not None else -1
-        for ordinal, source in enumerate(record.sources if record is not None else ()):
+        for source in record.sources if record is not None else ():
             error = None
             objects = None
             keep = source.keep
             try:
-                if root:
+                if root and failure is None:
                     for obj in source.fresh:
                         obj.ref_count_up()
                     self._engine.storage_manager.batched_put_sync_required(
@@ -652,7 +647,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                     source.ends[keep:],
                     phase=f"prefill_save:{self._step}",
                     memory_objs=source.fresh if root else None,
-                    error=error,
+                    error=error or failure,
                 )
                 if not root and objects is not None:
                     source.fresh = objects
@@ -673,15 +668,10 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 )
                 source.fresh = []  # Ownership moved into the committed manifest.
                 self._published_handles += len(objects)
-            # The final source's save acknowledgement flushes the batch, so
-            # publication errors surface on every rank before this callback
-            # returns; earlier sources ride it without another rendezvous.
-            self._ack(
-                ("save", record.identity, source.identity),
-                error,
-                flush=ordinal == last,
-            )
+            failure = failure or error
         self._record_host_time("publish", perf_counter() - publication_started)
+        if failure is not None:
+            raise self._callback_failure(failure)
         record.finished = True
         record.loads.clear()
         record.stores.clear()
@@ -894,20 +884,12 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             prior = self._prefixes.get(identity)
             error = None
             starts, ends, keys = [], [], []
-            summary = (False, None, None, None, None)
             try:
                 if prior is None:
                     starts, ends, keys = self._plan(req, req.restore_end, group, row)
                 else:
                     starts, ends, keys = prior.starts, prior.ends, prior.keys
                     extent, count = ends[-1] if ends else 0, len(prior.objects)
-                    summary = (
-                        True,
-                        prior.revision,
-                        extent,
-                        count,
-                        prior.slab_generation,
-                    )
                     if (
                         extent != req.restore_end
                         or count != (extent + 255) // 256
@@ -920,9 +902,10 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                         raise ValueError("Stale async lookahead manifest")
             except Exception as exc:
                 error = exc
-            # Bind agrees exact plans; retained manifests already own validated
-            # keys and shapes. Do not rebuild/broadcast long warm key lists.
-            self._ack(("prepare_load", identity, summary), error, flush=False)
+            # Plan A: no prepare_load acknowledgement; bind already agreed the
+            # exact plans and retained manifests on every rank.
+            if error is not None:
+                self._pending_error = self._pending_error or error
             objects = None
             try:
                 if prior is None:
@@ -982,9 +965,10 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 )
             except Exception as exc:
                 error = error or exc
-            self._prepared_ack(
-                ("load_prepared", record.identity, identity), error, flush=False
-            )
+            # Plan A: no load_prepared acknowledgement; the captured error
+            # raises at the end of the owning wait_for_load callback.
+            if error is not None:
+                self._pending_error = self._pending_error or error
         return record
 
     def _prepare_save(self, record: _AsyncRow) -> None:
@@ -1099,14 +1083,17 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         count, total, maximum = self._host_timings.get(phase, (0, 0.0, 0.0))
         self._host_timings[phase] = (count + 1, total + seconds, max(maximum, seconds))
 
-    def _prepared_ack(
-        self, identity: tuple, error: Exception | None, *, flush: bool = True
-    ) -> None:
-        if error is not None:
-            drained = self._drain_devices()
-            if isinstance(drained, LayerwisePrefillFenceError):
-                error = drained
-        self._ack(identity, error, flush=flush)
+    def _callback_failure(self, error: BaseException) -> Exception:
+        """Normalize an ordinary row failure for the model thread.
+
+        Without per-row acknowledgements the original exception surfaces
+        locally; the coordinator contract stays uniform by raising ValueError
+        for ordinary failures (clean abort) and LayerwisePrefillFenceError for
+        unknown-device-state poison.
+        """
+        if isinstance(error, (ValueError, LayerwisePrefillFenceError)):
+            return error
+        return ValueError(f"{type(error).__name__}: {error}")
 
     def _drain_devices(self) -> Exception | None:
         connector = self._engine.gpu_connector
@@ -1166,8 +1153,9 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         cause = None
         if isinstance(failure, ValueError):
             # All ranks completed the first all-gather, even if they entered
-            # different phases (notably abort vs source_done). Rendezvous once
-            # more with a constant identity, AFTER every local owner use drains.
+            # different phases (notably abort vs a per-step gate). Rendezvous
+            # once more with a constant identity, AFTER every local owner use
+            # drains.
             error = self._drain_devices()
             try:
                 self._drain_required_remote()

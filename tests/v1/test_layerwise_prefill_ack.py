@@ -526,31 +526,22 @@ def test_actual_async_two_steps_packet_counts(
         for rank, engine in enumerate(engines):
             stats = engine.layerwise_prefill_ack_stats()
             phases = stats["by_phase"]
-            assert stats["count"] == 712
-            assert phases["bind"]["count"] == phases["window_bind"]["count"] == 1
-            for phase in (
-                "validate",
-                "prepare_load",
-                "load_prepared",
-                "prepare_save",
-            ):
-                # Non-gating phases ride the next flushing acknowledgement.
-                assert phases[phase]["count"] == 101
-                assert phases[phase]["fast_count"] == phases[phase]["slow_count"] == 0
-                assert phases[phase]["serialized_bytes"] == 0
-            assert phases["load_ready"]["count"] == 101
-            assert 0 < phases["load_ready"]["max_payload_bytes"] < 4091
-            assert phases["source_done"]["count"] == 101
-            assert phases["source_done"]["fast_count"] == 101
-            assert phases["prepare_load"]["count"] == phases["save"]["count"] == 101
-            # The final source's save acknowledgement carries the row's batch.
-            assert phases["save"]["fast_count"] == 101
-            # window_bind/bind + load_ready/source_done/save x101 (per-row
-            # gates) + device_finish/finish/commit flushes.
-            assert counts[rank]["all_gather"] == stats["fast_count"] == 308
+            # Plan A: rows issue no acknowledgements; only the five per-step
+            # gates (window_bind, bind, device_finish, finish, commit) enter a
+            # collective.
+            assert stats["count"] == 5
+            assert set(phases) == {
+                "window_bind",
+                "bind",
+                "device_finish",
+                "finish",
+                "commit",
+            }
+            for phase in phases.values():
+                assert phase["count"] == 1
+            assert counts[rank]["all_gather"] == stats["fast_count"] == 5
             assert counts[rank]["all_gather_object"] == stats["slow_count"] == 0
-            assert stats["count"] == sum(p["count"] for p in phases.values())
-            assert stats["count"] > stats["fast_count"] + stats["slow_count"]
+            assert stats["count"] == stats["fast_count"] + stats["slow_count"]
 
 
 @pytest.mark.parametrize("failure", ["error", "serialization", "opposing_phase"])

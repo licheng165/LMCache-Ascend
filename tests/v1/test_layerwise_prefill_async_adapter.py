@@ -539,25 +539,30 @@ def _gloo_async_worker(
                 release = backend._release
 
                 def release_after_peer_drain(objects: list) -> None:
+                    if not backend._abort_drained:
+                        # Plan A: successful row commits release retained
+                        # predecessors locally, with no peer fence to await.
+                        release(objects)
+                        return
                     assert source_done.is_set(), (
                         "Released shared owners before peer lookahead fenced"
                     )
-                    assert backend._abort_drained
                     assert all(t.complete for t in connector.tickets if t.submitted)
                     released.set()
                     release(objects)
 
                 monkeypatch.setattr(backend, "_release", release_after_peer_drain)
-                with pytest.raises(ValueError, match="identity mismatch"):
-                    if rank == 0:
-                        adapter.abort_layerwise_prefill_step()
-                    else:
-                        adapter.finish_layerwise_prefill_save(current[0])
+                # Plan A: the row callback completes without any collective
+                # (its envelope broadcasts pair between the ranks); both ranks
+                # then meet in the abort_devices handshake, which also orders
+                # rank0's releases after rank1's delayed lookahead fence.
+                adapter.finish_layerwise_prefill_save(current[0])
+                assert not backend._step_future.done()
+                adapter.abort_layerwise_prefill_step()
                 assert backend._step_future.exception() is not None
                 adapter.abort_layerwise_prefill_step()
                 window.release_request(warm.request_id)
-                assert len(acknowledgements) == 2
-                assert acknowledgements[1] == ("failed_step_drained", 3)
+                assert acknowledgements == [(3, ("abort_devices",))]
                 assert not backend._bound and not backend._rows
                 assert not adapter.layerwise_prefill_request_persist_done(
                     warm.request_id
