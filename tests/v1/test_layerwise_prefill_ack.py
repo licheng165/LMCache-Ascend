@@ -191,8 +191,75 @@ def test_capacity_includes_header(ack_runtime: Any, overflow: int) -> None:
     for engine in ack_runtime.engines:
         stats = engine.layerwise_prefill_ack_stats()
         assert stats["max_payload_bytes"] == 4091 + overflow
-        assert stats["slow_count"] == overflow
-        assert stats["fast_count"] == 1 - overflow
+        # One byte over the packet no longer selects the object fallback: the
+        # oversized payload agrees by digest in the same fixed-size gather.
+        assert stats["slow_count"] == 0
+        assert stats["fast_count"] == 1 and stats["digest_count"] == overflow
+
+
+def test_large_equal_payload_agrees_by_digest_without_object_fallback(
+    ack_runtime: Any,
+) -> None:
+    identity = ("bind", _key({"payload": "x" * 8192}))
+    _ack_pair(ack_runtime, [identity, identity])
+    for rank, engine in enumerate(ack_runtime.engines):
+        stats = engine.layerwise_prefill_ack_stats()
+        assert stats["count"] == stats["fast_count"] == stats["digest_count"] == 1
+        assert stats["slow_count"] == 0
+        assert stats["max_payload_bytes"] > 4091
+        assert ack_runtime.counts[rank] == Counter(all_gather=1)
+
+
+def test_large_equal_objects_with_different_pickle_bytes_fall_back_and_pass(
+    ack_runtime: Any,
+) -> None:
+    # Equal mappings with different insertion orders pickle differently: their
+    # digests disagree and the exact object comparison still passes, so the
+    # digest is only an optimization, never the agreement itself.
+    configs = [
+        {"a": 1, "pad": "x" * 8192, "b": [2, 3]},
+        {"b": [2, 3], "pad": "x" * 8192, "a": 1},
+    ]
+    identities = [
+        (1, ("save", replace(_request(), request_configs=config), _key(config)))
+        for config in configs
+    ]
+    assert identities[0] == identities[1]
+    assert pickle.dumps(identities[0]) != pickle.dumps(identities[1])
+    _ack_pair(ack_runtime, identities)
+    for rank, engine in enumerate(ack_runtime.engines):
+        stats = engine.layerwise_prefill_ack_stats()
+        assert stats["count"] == 1 and stats["fast_count"] == 0
+        assert stats["digest_count"] == 0 and stats["slow_count"] == 1
+        assert stats["max_payload_bytes"] > 4091
+    assert all(
+        c == Counter(all_gather=1, all_gather_object=1) for c in ack_runtime.counts
+    )
+
+
+def test_tampered_digest_falls_back_to_exact_comparison(
+    ack_runtime: Any, monkeypatch: Any
+) -> None:
+    original = torch.distributed.all_gather
+
+    def gather(out: list, packet: Any, group: Any) -> None:
+        if ack_runtime.runtime.thread.rank == 1:
+            with torch.inference_mode(False):
+                packet = packet.clone()
+            packet[5] ^= 0xFF  # A well-formed digest packet with wrong bytes.
+            original(out, packet, group=group)
+            return
+        original(out, packet, group=group)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
+    _ack_pair(ack_runtime, [("bind", _key({"payload": "x" * 8192}))] * 2)
+    assert all(
+        c == Counter(all_gather=1, all_gather_object=1) for c in ack_runtime.counts
+    )
+    for engine in ack_runtime.engines:
+        stats = engine.layerwise_prefill_ack_stats()
+        assert stats["count"] == 1 and stats["digest_count"] == 0
+        assert stats["slow_count"] == 1
 
 
 def test_batched_acknowledgements_share_one_collective(ack_runtime: Any) -> None:
@@ -251,7 +318,7 @@ def test_error_status_rides_the_next_flush(ack_runtime: Any) -> None:
     assert all(c == Counter(all_gather=1) for c in ack_runtime.counts)
 
 
-def test_batch_overflow_uses_object_fallback(ack_runtime: Any) -> None:
+def test_batch_overflow_agrees_by_digest(ack_runtime: Any) -> None:
     # Distinct payloads: pickle memoization would collapse identical strings.
     bigs = [(1, ("validate", "load", "x" * 2500)), (1, ("prepare_load", "y" * 2500))]
 
@@ -264,11 +331,10 @@ def test_batch_overflow_uses_object_fallback(ack_runtime: Any) -> None:
     ack_runtime.runtime.parallel(lambda: run(0), lambda: run(1))
     for engine in ack_runtime.engines:
         stats = engine.layerwise_prefill_ack_stats()
-        assert stats["count"] == 3 and stats["slow_count"] == 1
+        assert stats["count"] == 3 and stats["slow_count"] == 0
+        assert stats["fast_count"] == stats["digest_count"] == 1
         assert stats["max_payload_bytes"] > 4091
-    assert all(
-        c == Counter(all_gather=1, all_gather_object=1) for c in ack_runtime.counts
-    )
+    assert all(c == Counter(all_gather=1) for c in ack_runtime.counts)
 
 
 def test_buffer_cache_tracks_group_and_world_without_tensor_item(
@@ -405,7 +471,12 @@ def test_transport_failure_is_fence_without_another_collective(
     def run(rank: int) -> None:
         backend = backends[rank]
         with pytest.raises(LayerwisePrefillFenceError, match="acknowledgement failed"):
-            backend._ack(("source_done", "x" * 8192 if slow else ""))
+            backend._ack(
+                (
+                    "source_done",
+                    ("x" if rank else "y") * 8192 if slow else "",
+                )
+            )
         assert isinstance(backend._step_future.exception(), LayerwisePrefillFenceError)
         assert backend._unsafe_transfer and not backend._abort_drained
 
@@ -428,6 +499,7 @@ def test_zero_reset_snapshot_and_bounded_phase_names(monkeypatch: Any) -> None:
         serialized_bytes=0,
         max_payload_bytes=0,
         fast_count=0,
+        digest_count=0,
         slow_count=0,
         by_phase={},
     )

@@ -9,6 +9,7 @@ from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError, wait
 from dataclasses import dataclass, field
 from weakref import WeakSet
+import hashlib
 import json
 import os
 import pickle
@@ -79,6 +80,7 @@ _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _SHARED_CPU_COMPACT_COMMIT_MESSAGE = "compact shared batch committed"
 _LAYERWISE_ACK_CAPACITY = 4096
 _LAYERWISE_ACK_HEADER = struct.Struct("!BI")
+_LAYERWISE_ACK_DIGEST_SIZE = 32
 _LAYERWISE_ACK_PHASES = frozenset(
     (
         "bind",
@@ -805,6 +807,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             serialized_bytes=0,
             max_payload_bytes=0,
             fast_count=0,
+            digest_count=0,
             slow_count=0,
             by_phase={},
         )
@@ -813,10 +816,13 @@ class AscendLMCacheEngine(LMCacheEngine):
         """Return an independent, bounded snapshot of host-only ACK statistics.
 
         Times use perf_counter, not device timing. Byte counts describe local
-        pickled statuses (excluding packet headers/padding and slow-path rework).
+        pickled statuses (excluding packet headers/padding and slow-path
+        rework); a digest-agreed payload still counts its full local pickle.
         Fast/slow counts include failed transport attempts; a failed packet
         gather counts as fast unless the shared packets selected the fallback.
-        Single-rank calls count/time the check but do not serialize or transport.
+        Digest counts are fast gathers whose oversized payload agreed by
+        sha256 without the object fallback. Single-rank calls count/time the
+        check but do not serialize or transport.
         Unknown phase names share the 'other' bucket; no identities are retained.
         """
         if getattr(self, "_layerwise_prefill_ack_stats", None) is None:
@@ -836,8 +842,12 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         Unlike rank0's possibly one-way MQ broadcast, the CPU collective also
         carries passive-rank failures. Fitting full statuses need one tensor
-        all-gather; every rank selects the object fallback from the same packets,
-        regardless of its local phase/error/size. Mixed protocol builds are not
+        all-gather; larger payloads never travel in full — each rank reduces
+        its local pickle to a sha256 digest carried in the same fixed-size
+        packet, and only a digest disagreement (or any malformed/mixed packet)
+        selects the object fallback. Every rank selects the fallback from the
+        same shared packets, regardless of its local phase/error/size, so the
+        agreement semantics stay Python equality. Mixed protocol builds are not
         supported. Call only on the model thread, outside graph capture.
 
         ``flush=False`` appends the status to a pending batch instead of
@@ -856,7 +866,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         on all ranks.
         """
         started = time.perf_counter()
-        payload_bytes = fast_count = slow_count = 0
+        payload_bytes = fast_count = slow_count = digest_count = 0
         buffers = None
         try:
             world_size = self.metadata.world_size
@@ -932,30 +942,73 @@ class AscendLMCacheEngine(LMCacheEngine):
                         not serial_failed
                         and 0 < payload_bytes <= len(packet) - header.size
                     )
-                    # Length includes the flag and length header. Zero means
-                    # object fallback, including a serialization error status.
-                    header.pack_into(
-                        packet, 0, int(fits), header.size + payload_bytes if fits else 0
+                    # A payload larger than the shared packet never travels in
+                    # full: the rank-local pickle is reduced to a sha256 digest
+                    # and every rank compares digests in the same fixed-size
+                    # packet gather. Digest equality implies pickle equality;
+                    # any disagreement (including equal objects whose pickle
+                    # bytes differ, e.g. mapping insertion order) falls back to
+                    # the exact object path, so agreement stays Python-equality.
+                    digest = (
+                        hashlib.sha256(payload).digest()
+                        if not serial_failed and not fits
+                        else b""
                     )
                     if fits:
+                        flag = 1
+                        length = header.size + payload_bytes
                         packet[header.size : header.size + payload_bytes] = payload
+                    elif digest:
+                        flag = 2
+                        length = header.size + len(digest)
+                        packet[header.size : header.size + len(digest)] = digest
+                    else:
+                        # Zero means object fallback, including a serialization
+                        # error status.
+                        flag = 0
+                        length = 0
+                    header.pack_into(packet, 0, flag, length)
                     fast_count = 1
                     torch.distributed.all_gather(tensors, tensor, group=group)
-                    lengths = []
+                    entries = []
                     for peer in packets:
                         if len(peer) != _LAYERWISE_ACK_CAPACITY:
                             break
-                        flag, length = header.unpack_from(peer)
+                        peer_flag, peer_length = header.unpack_from(peer)
                         # Check all shared packets before any Python decoding.
                         # STOP also detects a payload truncated into zero padding.
-                        if (
-                            flag != 1
-                            or not header.size < length <= len(peer)
-                            or peer[length - 1] != pickle.STOP[0]
-                        ):
+                        if peer_flag == 1:
+                            if (
+                                not header.size < peer_length <= len(peer)
+                                or peer[peer_length - 1] != pickle.STOP[0]
+                            ):
+                                break
+                        elif peer_flag == 2:
+                            if peer_length != header.size + _LAYERWISE_ACK_DIGEST_SIZE:
+                                break
+                        else:
                             break
-                        lengths.append(length)
-                    if len(lengths) != world_size:
+                        entries.append((peer_flag, peer_length))
+                    batches = None
+                    if len(entries) == world_size:
+                        if all(peer_flag == 1 for peer_flag, _ in entries):
+                            batches = [
+                                pickle.loads(peer[header.size : peer_length])
+                                for peer, (_, peer_length) in zip(
+                                    packets, entries, strict=True
+                                )
+                            ]
+                        elif all(peer_flag == 2 for peer_flag, _ in entries):
+                            if all(
+                                bytes(peer[header.size : header.size + len(digest)])
+                                == digest
+                                for peer in packets
+                            ):
+                                digest_count = 1
+                                # Digest-proven pickle equality: every peer's
+                                # batch equals this rank's local batch.
+                                batches = [batch] * world_size
+                    if batches is None:
                         fast_count, slow_count = 0, 1
                         gathered_payloads = [None] * world_size
                         # Gather bytes, not arbitrary objects a second time:
@@ -964,11 +1017,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                             gathered_payloads, payload, group=group
                         )
                         batches = [pickle.loads(p) for p in gathered_payloads]
-                    else:
-                        batches = [
-                            pickle.loads(peer[header.size : length])
-                            for peer, length in zip(packets, lengths, strict=True)
-                        ]
                 except Exception as exc:
                     # Never try another collective after a transport failure:
                     # the async backend must quarantine, not enter its drain ACK.
@@ -1041,6 +1089,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     values["max_payload_bytes"], payload_bytes
                 )
                 values["fast_count"] += fast_count
+                values["digest_count"] += digest_count
                 values["slow_count"] += slow_count
 
     def resolve_layerwise_prefill_group(
