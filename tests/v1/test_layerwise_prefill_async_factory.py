@@ -25,7 +25,11 @@ from lmcache_ascend.v1.layerwise_prefill_async import LayerwisePrefillAsyncBacke
 from lmcache_ascend.v1.layerwise_prefill_sync import LayerwisePrefillSyncBackend
 
 # Local
-from tests.v1.test_layerwise_prefill_async import DeferredCPUConnector, _compute
+from tests.v1.test_layerwise_prefill_async import (
+    DeferredCPUConnector,
+    _compute,
+    _join_publications,
+)
 from tests.v1.test_layerwise_prefill_async_adapter import _start
 from tests.v1.test_layerwise_prefill_sync import (
     CPUConnector,
@@ -452,6 +456,7 @@ def test_factory_to_adapter_binds_actual_101_rows_and_persists_two_steps(
             adapter.submit_layerwise_prefill_load(current[0])
             for metadata in current:
                 adapter.finish_layerwise_prefill_save(metadata)
+            _join_publications(backend)
             assert (
                 window.pending_jobs()
                 == window.pending_bytes()

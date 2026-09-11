@@ -375,6 +375,11 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
             return channel.get(timeout=10)
 
         result.broadcast_object_fn = broadcast
+        # The Plan B protocol thread must present this rank's identity to the
+        # thread-local fake TP group; production TP state is process-global.
+        result.protocol_thread_context = lambda rank=rank: setattr(
+            thread, "rank", rank
+        )
         if rank == 0:
             allocator = TensorMemoryAllocator(
                 torch.empty(slab_bytes, dtype=torch.uint8)

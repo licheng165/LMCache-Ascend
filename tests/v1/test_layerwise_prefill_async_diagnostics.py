@@ -30,6 +30,8 @@ from tests.v1.test_layerwise_prefill_async import (
     _bind,
     _dispose_cpu_quarantine,
     _execute,
+    _join_publications,
+    _protocol_of,
     _tp_backends,
 )
 from tests.v1.test_layerwise_prefill_sync import (
@@ -359,10 +361,17 @@ def test_unknown_fence_detaches_without_releasing_any_owner(
         backend._unsafe_transfer = True
         terminal = "abort_step"
     try:
-        with pytest.raises(LayerwisePrefillFenceError):
-            getattr(backend, terminal)(
-                *([metadata] if terminal == "finish_save" else [])
-            )
+        if terminal != "finish_save" or _protocol_of(backend) is None:
+            with pytest.raises(LayerwisePrefillFenceError):
+                getattr(backend, terminal)(
+                    *([metadata] if terminal == "finish_save" else [])
+                )
+        else:
+            # Plan B defers the row raise to the next entry; the unknown fence
+            # is already recorded locally and the owners stay quarantined.
+            backend.finish_save(metadata)
+            _join_publications(backend)
+            assert isinstance(backend._pending_error, LayerwisePrefillFenceError)
         assert not diagnostics.gc.callbacks
         assert backend._unsafe_transfer and backend._rows and backend._prefixes
         assert owner.is_valid() and owner.metadata.pin_count == 1

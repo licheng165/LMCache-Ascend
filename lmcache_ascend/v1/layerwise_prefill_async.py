@@ -13,6 +13,7 @@ from functools import wraps
 from time import perf_counter
 from typing import Any, Callable, Iterator, NoReturn
 import gc
+import os
 import weakref
 
 # Third Party
@@ -25,6 +26,9 @@ from lmcache.v1.storage_backend.required_put_queue import RequiredPutQueue
 import torch
 
 # First Party
+from lmcache_ascend.v1.layerwise_prefill_protocol import (
+    LayerwisePrefillProtocolThread,
+)
 from lmcache_ascend.v1.layerwise_prefill_sync import (
     LayerwisePrefillFenceError,
     LayerwisePrefillSyncBackend,
@@ -34,6 +38,17 @@ from lmcache_ascend.v1.layerwise_prefill_sync import (
 
 
 logger = init_logger(__name__)
+
+
+def _protocol_thread_enabled() -> bool:
+    raw = os.environ.get("VLLM_ASCEND_LAYERWISE_PROTOCOL_THREAD", "false")
+    value = raw.strip().lower()
+    if value not in ("true", "false"):
+        raise ValueError(
+            "VLLM_ASCEND_LAYERWISE_PROTOCOL_THREAD must be 'true' or 'false', "
+            f"got {raw!r}"
+        )
+    return value == "true"
 
 
 class _StepGC:
@@ -161,6 +176,17 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
     rescued by the usual vLLM worker exception propagation instead of a TP
     agreement collective. This restores the original layerwise_prefill_cache
     branch's error weight: zero CPU collectives per row.
+
+    Plan B (VLLM_ASCEND_LAYERWISE_PROTOCOL_THREAD=true): one
+    LayerwisePrefillProtocolThread per rank becomes the only emitter of the
+    CPU-group collectives that run while a step is bound — row publication
+    and bootstrap envelope broadcasts, the device_finish/finish/commit gates
+    and the abort/failure handshakes — overlapping publication with the next
+    rows' compute. window_bind/bind stay on the model thread, which the
+    previous step's join provably leaves with an empty protocol queue.
+    Captured row failures still ride the error envelopes; the local raise
+    moves to the next callback entry or gate wait. Publication admission is
+    bounded by the existing window limits at enqueue time.
     """
 
     _VALIDATE_ACK_ENABLED = False
@@ -199,6 +225,12 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         self._host_timings: dict[str, tuple[int, float, float]] = {}
         self._gc: _StepGC | None = None
         self._gc_finalizer: weakref.finalize | None = None
+        self._protocol = (
+            LayerwisePrefillProtocolThread(self)
+            if _protocol_thread_enabled()
+            else None
+        )
+        self._pending_resolves: dict[tuple[int, int], Future] = {}
 
     def _start_gc_step(self) -> None:
         try:
@@ -287,6 +319,10 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 raise ValueError("Async backend is poisoned; restart worker")
             if self._bound:
                 raise ValueError("Previous async step is unfinished")
+            if self._protocol is not None and self._protocol.queued:
+                # window_bind/bind ACKs stay on the model thread; the previous
+                # step's join must leave the single emitter with nothing.
+                raise ValueError("Async protocol queue is not drained at bind")
             if not isinstance(callbacks, tuple):
                 raise ValueError(
                     "Async bind requires the complete forward callbacks tuple"
@@ -391,6 +427,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         self._bank_events.clear()
         self._load_executions.clear()
         self._pending_error = None
+        self._pending_resolves.clear()
         self._previous_callbacks = tuple(self._callbacks.values())
         self._callbacks = registered
         self._abort_drained = False
@@ -425,7 +462,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         """
         stats = self._queue.stats() if self._queue is not None else {}
         ack = self._engine.layerwise_prefill_ack_stats()
-        return {
+        result = {
             "max_jobs": self._limits[0],
             "max_bytes": self._limits[1],
             "max_futures": self._limits[2],
@@ -443,6 +480,9 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 phase: (count, round(total * 1000, 3), round(maximum * 1000, 3))
                 for phase, (count, total, maximum) in self._host_timings.items()
             },
+            "protocol": (
+                self._protocol.stats() if self._protocol is not None else None
+            ),
             "ack": {
                 "calls": ack["count"],
                 "ms": round(ack["total_ms"], 3),
@@ -461,6 +501,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 },
             },
         }
+        return result
 
     @_gc_diagnostics(on_error_only=True)
     def wait_for_load(
@@ -502,7 +543,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             # The lookahead always runs, even with a captured error: peers
             # still receive this row's envelope broadcasts in the same order.
             if row + 1 < self.layer_count(group):
-                self._prepare_load(group, row + 1)
+                self._prepare_load(group, row + 1, flush=False)
             try:
                 if self._pending_error is None and not current.load_submitted:
                     self._enqueue_load(current)
@@ -516,6 +557,12 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 error = error or exc
             current.consumed = True
             self._ready.add((group, row))
+            if row + 1 < self.layer_count(group):
+                # Plan B: the lookahead's deferred bootstrap resolution waited
+                # here — still inside this callback, matching the inline path's
+                # boundary — after the current row's own host work gave the
+                # protocol thread its overlap window.
+                self._flush_pending_resolve(group, row + 1)
         self._load_seconds += perf_counter() - started
         # Plan A: no per-row acknowledgement; load-path failures raise locally
         # once this rank's broadcast sequence is complete. The pending error is
@@ -583,6 +630,9 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 if not source.save_submitted:
                     raise ValueError("Async lookahead arrived before current save")
                 if row + 1 < self.layer_count(group):
+                    self._flush_pending_resolve(group, row + 1)
+                    if self._pending_error is not None:
+                        return
                     self._enqueue_load(self._rows[group, row + 1])
         except Exception as exc:
             self._pending_error = self._pending_error or exc
@@ -624,6 +674,23 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         # error envelopes reach passive ranks symmetrically), and the failure
         # raises locally at the end of this callback.
         failure = error
+        if self._protocol is not None and record is not None:
+            # Plan B: hand publication to the protocol thread. The captured
+            # failure rides the same error envelopes; the local raise moves to
+            # the next callback entry or gate wait. Admission blocks on the
+            # window limits before the row leaves the model thread.
+            self._protocol.await_publication_capacity(record.bytes)
+            self._protocol.submit("publish", (record, failure))
+            if failure is None:
+                group, row = record.key[2:4]
+                self._ready.remove((group, row))
+                self._saved[group] += 1
+                self._save_seconds += perf_counter() - started
+            else:
+                # The inline path raised here; detach the GC step now instead
+                # of waiting for the deferred raise at the next entry.
+                self._stop_gc_step()
+            return self._step_future
         publication_started = perf_counter()
         root = self._engine.metadata.is_first_rank()
         for source in record.sources if record is not None else ():
@@ -696,14 +763,100 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         )
         return self.finish_save(metadata, validation_error=validation_error)
 
+    def close(self) -> None:
+        """Stop the protocol thread; storage/device teardown stays with the owner."""
+        if self._protocol is not None:
+            self._protocol.close()
+            self._protocol = None
+
+    def _protocol_publish(
+        self, record: _AsyncRow, failure: Exception | None
+    ) -> Exception | None:
+        """Publish one admitted row on the protocol thread (Plan B).
+
+        Mirrors the inline Plan A publication loop: rank0 puts fresh pages and
+        every rank runs the shared-handle envelope resolution carrying the
+        captured failure, commits the manifest, then releases the replaced
+        predecessor. Returns the row's final failure instead of raising; the
+        protocol thread records it for the model thread's next entry.
+        """
+        publication_started = perf_counter()
+        root = self._engine.metadata.is_first_rank()
+        for source in record.sources:
+            error = None
+            objects = None
+            keep = source.keep
+            try:
+                if root and failure is None:
+                    for obj in source.fresh:
+                        obj.ref_count_up()
+                    self._engine.storage_manager.batched_put_sync_required(
+                        source.keys[keep:], source.fresh, location="LocalCPUBackend"
+                    )
+            except BaseException as exc:
+                error = self._storage_error(exc)
+            try:
+                objects = self._engine.resolve_layerwise_prefill_row(
+                    *source.identity,
+                    source.keys[keep:],
+                    source.starts[keep:],
+                    source.ends[keep:],
+                    phase=f"prefill_save:{self._step}",
+                    memory_objs=source.fresh if root else None,
+                    error=error or failure,
+                )
+                if not root and objects is not None:
+                    source.fresh = objects
+            except Exception as exc:
+                error = error or exc
+            if error is None:
+                self._release(source.prior.objects[keep:])
+                self._prefixes[source.identity] = _RowPrefix(
+                    source.starts,
+                    source.ends,
+                    source.keys,
+                    source.prior.objects[:keep] + objects,
+                    self._step,
+                    self._engine.shared_cpu_cache_generation,
+                    # Retained chunk views are reused verbatim; only the
+                    # committed suffix acquires fresh typed views.
+                    source.prior.views[:keep] + _row_views(objects),
+                )
+                source.fresh = []  # Ownership moved into the committed manifest.
+                self._published_handles += len(objects)
+            failure = failure or error
+        self._record_host_time("publish", perf_counter() - publication_started)
+        if failure is not None:
+            # Keep the row's sources owned exactly like the inline path's
+            # raise-before-cleanup; abort_step releases the fresh objects.
+            return failure
+        record.finished = True
+        record.loads.clear()
+        record.stores.clear()
+        record.sources.clear()
+        return failure
+
     @_gc_diagnostics()
     def finish_step(self) -> None:
         """Drain every device operation first, then validate and commit 79/22 rows."""
         error = self._timed_call("drain", self._drain_devices)
         if error is None:
             error = self._pending_error
-        self._ack(("device_finish",), error)
-        super().finish_step()
+            if error is None and self._protocol is not None:
+                failure = self._protocol.failure()
+                if failure is not None:
+                    error = self._callback_failure(failure)
+        if self._protocol is not None:
+            # Plan B join: the thread drains its publication queue, runs the
+            # device_finish/finish/commit gates and only then resolves the
+            # shared step Future; this wait is the happens-before edge for the
+            # prefixes the next step's model thread reads.
+            LayerwisePrefillProtocolThread.wait(
+                self._protocol.submit("finish_step", error)
+            )
+        else:
+            self._ack(("device_finish",), error)
+            super().finish_step()
         self._rows.clear()
         self._bank_events.clear()
 
@@ -730,12 +883,25 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 self._drain_required_remote()
             except Exception as exc:
                 error = error or exc
-            try:
-                self._ack(("abort_devices",), error)
-            except Exception as exc:
-                failure = exc
+            if self._protocol is not None:
+                # Plan B: the protocol thread cancels its queued publications
+                # and completes the abort_devices handshake; this wait parks
+                # the emitter before any local owner cleanup runs.
+                try:
+                    LayerwisePrefillProtocolThread.wait(
+                        self._protocol.submit("abort", error)
+                    )
+                except Exception as exc:
+                    failure = exc
+                else:
+                    self._abort_drained = True
             else:
-                self._abort_drained = True
+                try:
+                    self._ack(("abort_devices",), error)
+                except Exception as exc:
+                    failure = exc
+                else:
+                    self._abort_drained = True
         if self._unsafe_transfer:
             raise LayerwisePrefillFenceError(
                 "Cannot release async slab owners; restart worker"
@@ -760,6 +926,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
         self._plans.clear()
         self._commit_starts.clear()
         self._ready.clear()
+        self._pending_resolves.clear()
         self._bound = False
         self._failed = True
         if failure is not None:
@@ -855,9 +1022,14 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             raise ValueError("Invalid async row identity")
         return key
 
-    def _prepare_load(self, group: int, row: int) -> _AsyncRow:
+    def _prepare_load(
+        self, group: int, row: int, *, flush: bool = True
+    ) -> _AsyncRow:
         if (group, row) in self._rows:
-            return self._rows[group, row]
+            record = self._rows[group, row]
+            if self._protocol is not None:
+                self._maybe_flush_resolve(group, row, flush)
+            return record
         key = self._view.rows_by_group[group][row]
         self._job_id += 1
         record = _AsyncRow(
@@ -879,6 +1051,26 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             key,
         )
         self._rows[group, row] = record
+        if self._protocol is not None:
+            missing = any(
+                self._prefixes.get(
+                    (req.request_id, req.allocation_generation, group, row)
+                )
+                is None
+                for req in self._requests
+            )
+            if missing:
+                # Plan B: the protocol thread resolves every missing request
+                # prefix for this row behind whatever is already queued; the
+                # current row blocks on it, a lookahead defers to its flush.
+                future = self._protocol.submit("resolve", (group, row))
+                self._pending_resolves[(group, row)] = future
+                if not flush:
+                    return record
+                self._flush_pending_resolve(group, row)
+                return record
+            self._warm_load_tickets(record, group, row)
+            return record
         for req in self._requests:
             identity = (req.request_id, req.allocation_generation, group, row)
             prior = self._prefixes.get(identity)
@@ -971,6 +1163,129 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 self._pending_error = self._pending_error or error
         return record
 
+    def _maybe_flush_resolve(self, group: int, row: int, flush: bool) -> None:
+        if flush:
+            self._flush_pending_resolve(group, row)
+
+    def _flush_pending_resolve(self, group: int, row: int) -> None:
+        """Wait out this row's deferred bootstrap resolution, then ticket it."""
+        future = self._pending_resolves.pop((group, row), None)
+        if future is None:
+            return
+        error = None
+        try:
+            self._protocol.wait(future)
+        except BaseException as exc:
+            error = exc if isinstance(exc, Exception) else RuntimeError(
+                f"{type(exc).__name__}: {exc}"
+            )
+        if error is not None:
+            # The root cause already rode the error envelopes; keep the
+            # pending slot's first-cause priority and skip ticket building.
+            self._pending_error = self._pending_error or error
+            return
+        self._warm_load_tickets(self._rows[group, row], group, row)
+
+    def _warm_load_tickets(self, record: _AsyncRow, group: int, row: int) -> None:
+        """Build load tickets from present prefixes (Plan B warm path)."""
+        key = record.key
+        for req in self._requests:
+            identity = (req.request_id, req.allocation_generation, group, row)
+            prior = self._prefixes.get(identity)
+            error = None
+            starts, ends, keys = [], [], []
+            try:
+                if prior is None:
+                    raise ValueError("Missing resolved async row prefix")
+                starts, ends, keys = prior.starts, prior.ends, prior.keys
+                extent, count = ends[-1] if ends else 0, len(prior.objects)
+                if (
+                    extent != req.restore_end
+                    or count != (extent + 255) // 256
+                    or not len(starts) == len(ends) == len(keys) == count
+                    or len(prior.views) != len(prior.objects)
+                    or prior.slab_generation
+                    != self._engine.shared_cpu_cache_generation
+                    or not 0 < prior.revision <= self._step
+                ):
+                    raise ValueError("Stale async lookahead manifest")
+            except Exception as exc:
+                error = exc
+            if error is not None:
+                self._pending_error = self._pending_error or error
+                continue
+            try:
+                self._reused_rows += 1
+                record.loads.append(
+                    self._prepare_ticket(
+                        req,
+                        key,
+                        prior.objects,
+                        starts,
+                        ends,
+                        False,
+                        tensors=prior.views,
+                    )
+                )
+            except Exception as exc:
+                self._pending_error = self._pending_error or exc
+
+    def _protocol_resolve_row(self, group: int, row: int) -> None:
+        """Resolve one row's missing prefixes on the protocol thread (Plan B).
+
+        Mirrors the inline bootstrap branch: rank0 fetches complete groups,
+        every rank then runs the shared-handle envelope resolution and
+        installs the retained prefix. Raises propagate to the descriptor
+        Future; root errors already reached the peers as error envelopes.
+        """
+        for req in self._requests:
+            identity = (req.request_id, req.allocation_generation, group, row)
+            if self._prefixes.get(identity) is not None:
+                continue
+            starts, ends, keys = self._plan(req, req.restore_end, group, row)
+            objects = None
+            error = None
+            if self._engine.metadata.is_first_rank():
+                try:
+                    if identity not in self._pending_rows:
+                        sources = self._engine.resolve_layerwise_prefill_group(
+                            req.request_id,
+                            group,
+                            self._plans[req.request_id, group, req.restore_end],
+                            phase=f"prefill_load:{self._step}",
+                        )
+                        for i, source in enumerate(sources):
+                            self._pending_rows[
+                                req.request_id,
+                                req.allocation_generation,
+                                group,
+                                i,
+                            ] = source
+                    objects = self._pending_rows[identity]
+                except BaseException as exc:
+                    error = self._storage_error(exc)
+            objects = self._engine.resolve_layerwise_prefill_row(
+                *identity,
+                keys,
+                starts,
+                ends,
+                phase=f"prefill_load:{self._step}",
+                memory_objs=objects,
+                error=error,
+            )
+            # Install ownership before the model thread can build tickets.
+            self._pending_rows.pop(identity, None)
+            self._prefixes[identity] = _RowPrefix(
+                starts,
+                ends,
+                keys,
+                objects,
+                self._step,
+                self._engine.shared_cpu_cache_generation,
+                _row_views(objects),
+            )
+            self._published_handles += len(keys)
+
     def _prepare_save(self, record: _AsyncRow) -> None:
         root = self._engine.metadata.is_first_rank()
         group, row = record.key[2:4]
@@ -1014,7 +1329,14 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             record.stores.append(
                 self._prepare_ticket(self._requests[0], record.key, [], [], [], True)
             )
-        if (
+        if self._protocol is not None:
+            # Plan B moves the window's admission limit from preparation to
+            # publication enqueue (await_publication_capacity); keep only the
+            # indivisible-row error here, since in-queue rows are the bounded
+            # backlog the thread is draining.
+            if record.bytes > self._limits[1]:
+                raise ValueError("Actual current row payload exceeds max_bytes")
+        elif (
             record.bytes
             + sum(
                 r.bytes

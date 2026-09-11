@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 import ast
+import re
 
 # Third Party
 from lmcache.v1.storage_backend.required_put_queue import RequiredPutQueue
@@ -137,6 +138,38 @@ def _backend(engine: Any) -> LayerwisePrefillAsyncBackend:
     return backend
 
 
+def _protocol_of(backend: Any) -> Any:
+    """Return the Plan B protocol thread, or None for the inline Plan A path."""
+    return getattr(backend, "_protocol", None)
+
+
+def _join_publications(backend: Any) -> None:
+    protocol = _protocol_of(backend)
+    if protocol is not None:
+        protocol.join_publications()
+
+
+def _expect_row_failure(backend: Any, pattern: str, call: Any) -> None:
+    """Assert a row-path failure surfaces either at the call or the next entry.
+
+    Plan A raises inline at the callback's end; Plan B's protocol thread
+    records the same root cause and the model thread sees it at its next
+    entry, so the joined backend must carry it as the pending error. Callback
+    identity failures (no row to publish) still raise inline under Plan B.
+    """
+    if _protocol_of(backend) is None:
+        with pytest.raises(ValueError, match=pattern):
+            call()
+        return
+    try:
+        call()
+    except ValueError as exc:
+        assert re.search(pattern, str(exc)), exc
+        return
+    _join_publications(backend)
+    assert re.search(pattern, str(backend._pending_error)), backend._pending_error
+
+
 def _callbacks(requests: list) -> tuple:
     generations = tuple((r.request_id, r.allocation_generation) for r in requests)
     callbacks = []
@@ -213,6 +246,11 @@ def _execute(
             assert future is None or returned is future
             future = returned
             assert not future.done()
+        protocol = getattr(backend, "_protocol", None)
+        if protocol is not None:
+            # Plan B admits publication asynchronously; join the queue before
+            # asserting the window is empty between execution groups.
+            protocol.join_publications()
         assert (
             backend.pending_jobs()
             == backend.pending_bytes()
@@ -295,7 +333,7 @@ def test_async_host_timing_scopes_include_save_preparation_and_publication_ack(
         delay(owner, name, seconds)
 
     _execute(engine, backend, [_request()])
-    assert backend.window_stats()["async_host"] == {
+    expected = {
         "window_bind": (1, 32.0, 32.0),
         # H2D excludes source resolution, planning and preparation ACKs.
         "prepare_load": (101, 101.0, 1.0),
@@ -312,6 +350,18 @@ def test_async_host_timing_scopes_include_save_preparation_and_publication_ack(
         "remote_submit": (2, 256.0, 128.0),
         "remote_drain": (1, 256.0, 256.0),
     }
+    scopes = backend.window_stats()["async_host"]
+    if _protocol_of(backend) is None:
+        assert scopes == expected
+    else:
+        # Plan B runs publication/remote scopes concurrently with the model
+        # thread on one shared fake clock; counts stay exact and every scope
+        # still spans at least its own deterministic cost.
+        assert set(scopes) == set(expected)
+        for phase, (count, total_ms, max_ms) in scopes.items():
+            calls, total, maximum = expected[phase]
+            assert count == calls
+            assert total_ms >= total and max_ms >= maximum
 
 
 @pytest.mark.parametrize("request_count", [1, 2])
@@ -620,6 +670,7 @@ def test_pre_hcom_only_enqueues_and_delayed_d2h_not_published(
         connector.gate.set()
         future = completing.result(5)
     assert not future.done()
+    _join_publications(backend)
     assert backend.pending_jobs() == 1 and backend.pending_bytes() == 600
     backend.finish_save(callbacks[1])
     backend.abort_request("req-0")
@@ -683,8 +734,11 @@ def test_errors_deferred_until_post_hcom_all_tp(
             if failure == "finish_identity"
             else None
         )
-        with pytest.raises(ValueError, match="native|identity|duplicated"):
-            backend.finish_save(metadata, validation_error=error)
+        _expect_row_failure(
+            backend,
+            "native|identity|duplicated",
+            lambda: backend.finish_save(metadata, validation_error=error),
+        )
         backend.abort_request("req-0")
         with pytest.raises(ValueError, match="poisoned"):
             _bind(engine, backend, [_request(generation=2)])
@@ -778,8 +832,9 @@ def test_real_connector_launch_before_projection_fence_after_hcom(
     row_env.compute.run_to(len(row_env.compute.queue))
     row_env.events.append(("model", "hcom"))
     if failure:
-        with pytest.raises(ValueError, match="native launch|event record"):
-            backend.finish_save(metadata)
+        _expect_row_failure(
+            backend, "native launch|event record", lambda: backend.finish_save(metadata)
+        )
     else:
         assert not backend.finish_save(metadata).done()
     assert not row_env.pending
@@ -835,8 +890,14 @@ def test_unknown_fence_quarantines_local_step_and_owners(
     backend.submit_save(metadata, _registry(engine)[metadata.row.layer_name])
     engine.gpu_connector.fence_error = True
     if not at_abort:
-        with pytest.raises(LayerwisePrefillFenceError, match="unknown"):
+        if _protocol_of(backend) is None:
+            with pytest.raises(LayerwisePrefillFenceError, match="unknown"):
+                backend.finish_save(metadata)
+        else:
             backend.finish_save(metadata)
+            _join_publications(backend)
+            assert "unknown" in str(backend._pending_error)
+            assert backend._unsafe_transfer
     with pytest.raises(LayerwisePrefillFenceError, match="Cannot release"):
         backend.abort_request("req-0")
     assert backend._unsafe_transfer
@@ -872,8 +933,7 @@ def test_stale_generation_finish_preserves_current_record(page_runtime: Any) -> 
     _compute(engine, [req], metadata)
     backend.submit_save(metadata, _registry(engine)[metadata.row.layer_name])
     current = backend._rows[0, 0]
-    with pytest.raises(ValueError, match="generations"):
-        backend.finish_save(old)
+    _expect_row_failure(backend, "generations", lambda: backend.finish_save(old))
     assert backend._rows[0, 0] is current and not current.finished
     assert current.sources and all(obj.is_valid() for obj in current.sources[0].fresh)
     backend.abort_request("req-0")
@@ -1185,8 +1245,11 @@ def test_previous_step_same_generation_callback_never_consumes_current_row(
             old[0] if phase == "submit" else current,
             _registry(engine)[current.row.layer_name],
         )
-        with pytest.raises(ValueError, match="registered"):
-            backend.finish_save(old[0] if phase == "finish" else current)
+        _expect_row_failure(
+            backend,
+            "registered",
+            lambda: backend.finish_save(old[0] if phase == "finish" else current),
+        )
         assert backend._rows[0, 0] is record and not record.finished
         assert all(obj.is_valid() for obj in record.sources[0].fresh)
     assert backend._saved == [0, 0]
@@ -1465,10 +1528,19 @@ def test_storage_baseexception_is_normalized_drained_and_acknowledged_all_tp(
 
     def run(rank: int) -> None:
         backend = backends[rank]
-        with pytest.raises(ValueError, match=interruption.__name__):
-            if stage == "local_put":
-                backend.finish_save(callbacks[rank])
-            else:
+        if _protocol_of(backend) is None or stage != "local_put":
+            with pytest.raises(ValueError, match=interruption.__name__):
+                if stage == "local_put":
+                    backend.finish_save(callbacks[rank])
+                else:
+                    backend.finish_step()
+        else:
+            # Plan B: the local-put interruption rides the publication thread;
+            # finish_step's gate wait then re-raises it on both ranks.
+            backend.finish_save(callbacks[rank])
+            _join_publications(backend)
+            assert interruption.__name__ in str(backend._pending_error)
+            with pytest.raises(ValueError, match=interruption.__name__):
                 backend.finish_step()
         # Plan A: the local raise performs no drain; abort_request does.
         backend.abort_request("req-0")

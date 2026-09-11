@@ -12,6 +12,7 @@ from threading import RLock
 from types import SimpleNamespace
 from typing import Any
 import ast
+import re
 import multiprocessing
 import os
 import traceback
@@ -42,6 +43,8 @@ from tests.v1.test_layerwise_prefill_async import (
     DeferredCPUConnector,
     _callbacks,
     _compute,
+    _join_publications,
+    _protocol_of,
 )
 from tests.v1.test_layerwise_prefill_sync import (
     _registry,
@@ -171,6 +174,7 @@ def test_adapter_101_rows_do_not_wait_assembly_at_eight_jobs(
                 adapter.submit_layerwise_prefill_load(current[0])
                 for metadata in current:
                     adapter.finish_layerwise_prefill_save(metadata)
+                _join_publications(adapter._layerwise_prefill_backend)
                 assert (
                     window.pending_jobs()
                     == window.pending_bytes()
@@ -229,6 +233,7 @@ def test_adapter_full_two_chunk_flow_with_async_scheduling_resolution(
             adapter.submit_layerwise_prefill_load(current[0])
             for metadata in current:
                 adapter.finish_layerwise_prefill_save(metadata)
+            _join_publications(adapter._layerwise_prefill_backend)
             assert (
                 window.pending_jobs()
                 == window.pending_bytes()
@@ -266,9 +271,28 @@ def test_coordinator_validation_reaches_backend_post_hcom(
         )
     adapter.submit_layerwise_prefill_load(bad if phase == "load" else metadata)
     # The model reaches projection/HCOM before coordinator errors are surfaced.
-    with pytest.raises(ValueError, match="generation|identity|binding"):
-        adapter.finish_layerwise_prefill_save(bad if phase == "finish" else metadata)
-    adapter._layerwise_prefill_backend.abort_step()
+    backend = adapter._layerwise_prefill_backend
+    if _protocol_of(backend) is None:
+        with pytest.raises(ValueError, match="generation|identity|binding"):
+            adapter.finish_layerwise_prefill_save(
+                bad if phase == "finish" else metadata
+            )
+    else:
+        # Plan B: the row failure rides the publication thread's error
+        # envelope and surfaces at the next entry; adapter-level validation
+        # of the bad metadata may still raise inline first.
+        try:
+            adapter.finish_layerwise_prefill_save(
+                bad if phase == "finish" else metadata
+            )
+        except ValueError as exc:
+            assert re.search("generation|identity|binding", str(exc)), exc
+        else:
+            _join_publications(backend)
+            assert re.search(
+                "generation|identity|binding", str(backend._pending_error)
+            ), backend._pending_error
+    backend.abort_step()
 
 
 def _assert_window_end_log(line: str, stats: dict, remote_jobs: int) -> None:
@@ -427,6 +451,7 @@ def _gloo_async_worker(
                     model_hcom()
                     for metadata in current:
                         adapter.finish_layerwise_prefill_save(metadata)
+                    _join_publications(backend)
                     assert (
                         window.pending_jobs()
                         == window.pending_bytes()
