@@ -899,7 +899,10 @@ def test_four_prepared_mappings_512_chunks_101_rows_no_repacking_or_readback(row
         "uploads": before["uploads"] + 303,
     }
     assert all(not upload["non_blocking"] for upload in env.uploads)
-    assert sum(event[1] == "registered" for event in env.events) == 101 * 512
+    # The chunk memo resolves each distinct (mapping, chunk) tensor once; the
+    # same chunk objects recur across all 101 rows, so only 4 x 512 first-time
+    # registrations remain instead of one per row.
+    assert sum(event[1] == "registered" for event in env.events) == 4 * 512
     assert sum(event[1] == "sync" for event in env.events) == 101
     for (group, bank), (planes, chunks, mapping, _, snapshots) in banks.items():
         cursor = 0

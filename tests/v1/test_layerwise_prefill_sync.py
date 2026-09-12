@@ -195,7 +195,12 @@ class CPUConnector:
         pass
 
     def prepare_layerwise_prefill_slots(
-        self, mapping: torch.Tensor, *, kv_group: int, capacity: int
+        self,
+        mapping: torch.Tensor,
+        *,
+        kv_group: int,
+        capacity: int,
+        identity: Any = None,
     ) -> _CPUSlotPlan:
         assert [self.get_num_layers(group) for group in (0, 1)] == [79, 22]
         assert mapping.device.type == "cpu" and mapping.dtype == torch.long
@@ -672,10 +677,16 @@ def test_slot_preparation_failure_reaches_all_tp_before_row_transfer(
     connector = engines[bad_rank].gpu_connector
     prepare = connector.prepare_layerwise_prefill_slots
 
-    def fail(mapping: torch.Tensor, *, kv_group: int, capacity: int) -> Any:
+    def fail(
+        mapping: torch.Tensor,
+        *,
+        kv_group: int,
+        capacity: int,
+        identity: Any = None,
+    ) -> Any:
         if len(connector.prepared) == fail_at:
             raise RuntimeError("slot preparation sentinel failure")
-        return prepare(mapping, kv_group=kv_group, capacity=capacity)
+        return prepare(mapping, kv_group=kv_group, capacity=capacity, identity=identity)
 
     monkeypatch.setattr(connector, "prepare_layerwise_prefill_slots", fail)
     counts = [

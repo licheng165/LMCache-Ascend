@@ -49,11 +49,17 @@ def test_real_connector_reuses_four_bind_plans_across_all_rows(
     transfer = connector.transfer_layerwise_prefill_row
     prepared = []
 
-    def prepare_slots(mapping: torch.Tensor, *, kv_group: int, capacity: int) -> Any:
+    def prepare_slots(
+        mapping: torch.Tensor,
+        *,
+        kv_group: int,
+        capacity: int,
+        identity: Any = None,
+    ) -> Any:
         assert [connector.get_num_layers(group) for group in (0, 1)] == [79, 22]
         assert mapping.device.type == "cpu" and mapping.dtype == torch.long
         assert capacity == 64
-        plan = prepare(mapping, kv_group=kv_group, capacity=capacity)
+        plan = prepare(mapping, kv_group=kv_group, capacity=capacity, identity=identity)
         assert not isinstance(plan, torch.Tensor)
         prepared.append(weakref.ref(plan))
         return plan

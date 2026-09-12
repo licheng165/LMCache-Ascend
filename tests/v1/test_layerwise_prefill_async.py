@@ -474,6 +474,7 @@ def test_async_metrics_reset_at_bind_root_passive_and_log_snapshots(
                 "max_ms": round(ack_stats["max_ms"], 3),
                 "fast": ack_stats["fast_count"],
                 "slow": ack_stats["slow_count"],
+                "digest": ack_stats["digest_count"],
                 "payload_bytes": ack_stats["serialized_bytes"],
                 "max_payload_bytes": ack_stats["max_payload_bytes"],
                 "phase": {

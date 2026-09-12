@@ -491,6 +491,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
                 "max_ms": round(ack["max_ms"], 3),
                 "fast": ack["fast_count"],
                 "slow": ack["slow_count"],
+                "digest": ack.get("digest_count", 0),
                 "payload_bytes": ack["serialized_bytes"],
                 "max_payload_bytes": ack["max_payload_bytes"],
                 "phase": {

@@ -194,6 +194,7 @@ class LayerwisePrefillSyncBackend:
         frozen = ()
         caches = {}
         slots = {}
+        slot_identities = {}
         plans = {}
         commit_starts = {}
         plan_seconds = slot_seconds = 0.0
@@ -371,6 +372,7 @@ class LayerwisePrefillSyncBackend:
                         raise ValueError("Layerwise-prefill blocks exceed the KV plane")
                     if entry is not None and entry[0] == end:
                         slots[key[:1] + key[2:]] = entry[1]
+                        slot_identities[key[:1] + key[2:]] = key
                         continue
                     block_tensor = torch.tensor(blocks, dtype=torch.long, device="cpu")
                     if entry is not None and entry[0] < end and not needs_full:
@@ -388,6 +390,7 @@ class LayerwisePrefillSyncBackend:
                         )
                     self._slot_cache[key] = (end, grown)
                     slots[key[:1] + key[2:]] = grown
+                    slot_identities[key[:1] + key[2:]] = key
                 slot_seconds += perf_counter() - stage_started
             self._engine.initialize_layerwise_prefill_layout(caches)
             prepare = getattr(
@@ -402,6 +405,7 @@ class LayerwisePrefillSyncBackend:
                         mapping,
                         kv_group=group,
                         capacity=int(plane.shape[0] * plane.shape[1]),
+                        identity=slot_identities.get(identity),
                     )
                     prepared_count += 1
                 slot_seconds += perf_counter() - stage_started

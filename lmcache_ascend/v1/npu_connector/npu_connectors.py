@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import contextmanager, nullcontext
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -8,6 +9,7 @@ import os
 from threading import get_ident
 from time import perf_counter
 from typing import Any, Generator, List, Optional, Sequence, Set, Union
+import weakref
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -1672,6 +1674,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         *,
         kv_group: int,
         capacity: int,
+        identity: Any = None,
     ) -> _PreparedLayerwisePrefillSlots:
         """Snapshot and validate an injective bank mapping once per caller bind.
 
@@ -1681,6 +1684,17 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         The returned internal plan owns its storage independently of the input.
         Keep it within the bind that supplied the bank mapping, then discard it;
         the connector does not cache plans or retain successful row owners.
+
+        A hashable ``identity`` (stable per request/algorithm mapping owner,
+        e.g. request/generation/bank/group) additionally admits an incremental
+        validation fast path: when the mapping extends a previously validated
+        prefix verbatim (``torch.equal`` on the overlapping head), only the
+        appended tail is range/duplicate checked against the cached prefix
+        value set. The accept/reject contract is identical to full validation:
+        the whole mapping is still proven in-range and injective; a mismatched
+        prefix falls back to full validation and replaces the cache entry.
+        Entries are keyed by identity, bounded FIFO, and never shared across
+        groups/capacities/devices.
         """
         if getattr(self, "_layerwise_prefill_row_failed_owners", None) is not None:
             raise RuntimeError("A previous prefill row completion fence failed")
@@ -1717,6 +1731,45 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 .to(device="cpu", dtype=torch.int64)
                 .clone(memory_format=torch.contiguous_format)
             )
+            cache = getattr(self, "_layerwise_prefill_slots_cache", None)
+            if cache is None:
+                cache = OrderedDict()
+                self._layerwise_prefill_slots_cache = cache
+            length = slots_cpu.numel()
+            if identity is not None and cache:
+                entry = cache.get(identity)
+                if (
+                    entry is not None
+                    and entry[0] == kv_group
+                    and entry[1] == capacity
+                    and length >= entry[2]
+                    and torch.equal(slots_cpu[: entry[2]], entry[3])
+                ):
+                    validated, used = entry[2], entry[4]
+                    tail = slots_cpu[validated:]
+                    if tail.numel():
+                        values = tail.tolist()
+                        if min(values) < 0 or max(values) >= capacity:
+                            raise ValueError("Prefill row slot is out of KV capacity")
+                        tail_set = set(values)
+                        if len(tail_set) != len(values) or used & tail_set:
+                            raise ValueError(
+                                "Prefill prepared slot_mapping contains duplicate slots"
+                            )
+                        used |= tail_set
+                    cache[identity] = (kv_group, capacity, length, slots_cpu, used)
+                    cache.move_to_end(identity)
+                    slots_npu = slots_cpu.to(device=device, dtype=torch.int64)
+                    return _PreparedLayerwisePrefillSlots(
+                        self,
+                        layout,
+                        kv_group,
+                        capacity,
+                        device,
+                        slots_npu,
+                        slots_npu._version,
+                        length,
+                    )
             slot_values = slots_cpu.tolist()
             if any(slot < 0 or slot >= capacity for slot in slot_values):
                 raise ValueError("Prefill row slot is out of KV capacity")
@@ -1725,16 +1778,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "Prefill prepared slot_mapping contains duplicate slots"
                 )
             slots_npu = slots_cpu.to(device=device, dtype=torch.int64)
-        return _PreparedLayerwisePrefillSlots(
-            self,
-            layout,
-            kv_group,
-            capacity,
-            device,
-            slots_npu,
-            slots_npu._version,
-            len(slot_values),
-        )
+            if identity is not None:
+                cache[identity] = (
+                    kv_group,
+                    capacity,
+                    length,
+                    slots_cpu,
+                    set(slot_values),
+                )
+                cache.move_to_end(identity)
+                while len(cache) > 32:
+                    cache.popitem(last=False)
+            return _PreparedLayerwisePrefillSlots(
+                self,
+                layout,
+                kv_group,
+                capacity,
+                device,
+                slots_npu,
+                slots_npu._version,
+                len(slot_values),
+            )
 
     def _validate_layerwise_prefill_row(
         self,
@@ -1866,6 +1930,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         offsets, sizes, ranges = [], [], []
         total_tokens = 0
         consecutive = True
+        # Retained-manifest chunk views recur verbatim across steps and rows;
+        # their geometry conclusions are memoized per live Tensor object (id +
+        # weakref liveness + expected packed numel) so a growing prefix ticket
+        # re-validates only its new chunks. Failures raise before memoizing,
+        # and per-call range/boundary checks below stay outside the memo.
+        memo = getattr(self, "_layerwise_prefill_chunk_memo", None)
+        if memo is None:
+            memo = {}
+            self._layerwise_prefill_chunk_memo = memo
+        packed_width = sum(widths)
         for chunk, start, end in zip(chunks, starts, ends, strict=True):
             if type(start) is not int or type(end) is not int:
                 raise ValueError("Prefill row ranges must contain integers")
@@ -1879,18 +1953,36 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     "Prefill row requires positive ranges inside slot_mapping"
                 )
             size = end - start
-            if (
-                not isinstance(chunk, torch.Tensor)
-                or chunk.device.type != "cpu"
-                or chunk.dtype != torch.bfloat16
-                or chunk.layout != torch.strided
-                or not chunk.is_contiguous()
-                or chunk.numel() != size * sum(widths)
-            ):
-                raise ValueError(
-                    "Prefill row CPU chunks must be local contiguous BF16 tensors "
-                    "with exact packed plane sizes, including tails"
-                )
+            expected = size * packed_width
+            entry = memo.get(id(chunk))
+            if entry is not None and entry[0]() is chunk and expected in entry[1]:
+                pass
+            else:
+                if (
+                    not isinstance(chunk, torch.Tensor)
+                    or chunk.device.type != "cpu"
+                    or chunk.dtype != torch.bfloat16
+                    or chunk.layout != torch.strided
+                    or not chunk.is_contiguous()
+                    or chunk.numel() != expected
+                ):
+                    raise ValueError(
+                        "Prefill row CPU chunks must be local contiguous BF16 "
+                        "tensors with exact packed plane sizes, including tails"
+                    )
+                if entry is not None and entry[0]() is chunk:
+                    memo[id(chunk)] = (entry[0], entry[1] + (expected,), entry[2])
+                else:
+                    memo[id(chunk)] = (
+                        weakref.ref(chunk),
+                        (expected,),
+                        0,
+                    )
+                    if len(memo) > 8192:
+                        for stale in [
+                            key for key, item in memo.items() if item[0]() is None
+                        ]:
+                            del memo[stale]
             offsets.append(total_tokens)
             sizes.append(size)
             if ranges and ranges[-1][1] != local_start:
@@ -1963,15 +2055,27 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 )
             slots_npu = slots.to(device=device, dtype=torch.int64).contiguous()
         owners.append(slots_npu)
-        pointers = [
-            self._resolve_registered_cpu_source_device_ptr(
+        memo = getattr(self, "_layerwise_prefill_chunk_memo", None)
+        if memo is None:
+            memo = {}
+            self._layerwise_prefill_chunk_memo = memo
+        pointers = []
+        for index, chunk in enumerate(chunks):
+            entry = memo.get(id(chunk))
+            if entry is not None and entry[0]() is chunk and entry[2]:
+                pointers.append(entry[2])
+                continue
+            pointer = self._resolve_registered_cpu_source_device_ptr(
                 chunk,
                 layer_id=-1,
                 chunk_index=index,
                 source="transfer_layerwise_prefill_row",
             )
-            for index, chunk in enumerate(chunks)
-        ]
+            pointers.append(pointer)
+            if entry is not None and entry[0]() is chunk:
+                memo[id(chunk)] = (entry[0], entry[1], pointer)
+            else:
+                memo[id(chunk)] = (weakref.ref(chunk), (), pointer)
         if any(ptr <= 0 for ptr in pointers):
             raise RuntimeError("Prefill row CPU registered pointer must be positive")
         if upload_sources is not None:
