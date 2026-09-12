@@ -243,6 +243,7 @@ def test_per_generation_stats_are_bounded_reset_and_snapshots_are_independent(
                 )
         expected = {
             "enabled": True,
+            "mode": "default",
             "threshold": (700, 10, 10),
             "counts": (2, 2, 2),
             "total_ms": (375.0, 750.0, 1125.0),
@@ -555,6 +556,7 @@ def test_disabled_gc_manual_collections_preserve_global_policy_and_callbacks(
         stats = backend.window_stats()["gc"]
         assert stats == {
             "enabled": False,
+            "mode": "default",
             "threshold": threshold,
             "counts": (1, 1, 1),
             "total_ms": (125.0, 125.0, 125.0),

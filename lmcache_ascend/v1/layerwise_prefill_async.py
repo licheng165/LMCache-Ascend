@@ -59,8 +59,9 @@ class _StepGC:
     The global callback/finalizer owns only these counters, never the backend.
     """
 
-    def __init__(self, step: int) -> None:
+    def __init__(self, step: int, mode: str = "default") -> None:
         self.step = step
+        self.mode = mode
         self.enabled, self.threshold = gc.isenabled(), gc.get_threshold()
         self.started: list[float | None] = [None, None, None]
         self.counts = [0, 0, 0]
@@ -107,6 +108,7 @@ class _StepGC:
         try:
             return {
                 "enabled": self.enabled,
+                "mode": self.mode,
                 "threshold": self.threshold,
                 "counts": tuple(self.counts),
                 "total_ms": tuple(round(value * 1000, 3) for value in self.total),
@@ -237,7 +239,7 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             if self._gc_finalizer is not None:
                 return  # A rejected rebind must not duplicate the live callback.
             self._gc = None
-            self._gc = _StepGC(self._step + 1)
+            self._gc = _StepGC(self._step + 1, getattr(self, "_gc_mode", "default"))
             # Register cleanup first so even interrupted registration cannot leak.
             self._gc_finalizer = weakref.finalize(self, self._gc.close)
             self._gc.registry.append(self._gc)
@@ -850,7 +852,8 @@ class LayerwisePrefillAsyncBackend(LayerwisePrefillSyncBackend):
             # Plan B join: the thread drains its publication queue, runs the
             # device_finish/finish/commit gates and only then resolves the
             # shared step Future; this wait is the happens-before edge for the
-            # prefixes the next step's model thread reads.
+            # prefixes the next step's model thread reads. The stepwise young
+            # collection runs inside that tail, after the commit gate.
             LayerwisePrefillProtocolThread.wait(
                 self._protocol.submit("finish_step", error)
             )

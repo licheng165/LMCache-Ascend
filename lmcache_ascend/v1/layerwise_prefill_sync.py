@@ -12,6 +12,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Iterator
+import gc
+import os
 
 # Third Party
 from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
@@ -55,6 +57,42 @@ class _RowPrefix:
 def _row_views(objects: list[MemoryObj]) -> list:
     """Acquire typed CPU views once per chunk; ownership stays with objects."""
     return [obj.tensor for obj in objects]
+
+
+def _layerwise_gc_mode() -> str:
+    raw = os.environ.get("VLLM_ASCEND_LAYERWISE_GC_MODE", "default")
+    value = raw.strip().lower()
+    if value not in ("default", "freeze", "stepwise"):
+        raise ValueError(
+            "VLLM_ASCEND_LAYERWISE_GC_MODE must be 'default', 'freeze' or "
+            f"'stepwise', got {raw!r}"
+        )
+    return value
+
+
+def _apply_layerwise_gc_policy() -> str:
+    """Apply the P worker's process-wide layerwise prefill GC policy.
+
+    Plan C (design doc section 17.5): 0911-1 measured gen2 pauses of
+    1.0-3.1 s every 8-9 steps (~19.5 s per 120k request) while gen0/gen1
+    stay amortized at 20-70 ms/step. ``freeze`` keeps the harmless young
+    cadence and makes gen2 both hundredfold rarer and bounded to the
+    post-freeze survivors when it eventually fires. ``stepwise`` is the
+    experiment mode; ``default`` changes nothing.
+    """
+    mode = _layerwise_gc_mode()
+    if mode == "freeze":
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(700, 10, 1000)
+        logger.info(
+            "[PREFILL_GC_POLICY] mode=freeze collected_and_frozen=true "
+            "threshold=(700, 10, 1000)"
+        )
+    elif mode == "stepwise":
+        gc.disable()
+        logger.info("[PREFILL_GC_POLICY] mode=stepwise disabled=true")
+    return mode
 
 
 class LayerwisePrefillSyncBackend:
@@ -120,6 +158,13 @@ class LayerwisePrefillSyncBackend:
             is True
         )
         self._prepared_slot_count = 0
+        # Plan C policy applies to the whole P worker process once per backend.
+        self._gc_mode = _apply_layerwise_gc_policy()
+        # Incremental bind caches (0911-2): per (request, generation) aligned
+        # high-water plan chains and grown slot tensors. Dropped with the
+        # request/generation in abort_request and at generation-advancing binds.
+        self._plan_cache: dict[tuple, tuple[int, tuple, int]] = {}
+        self._slot_cache: dict[tuple, tuple[int, Any]] = {}
 
     @property
     def topology_signature(self) -> str:
@@ -201,6 +246,20 @@ class LayerwisePrefillSyncBackend:
                         raise ValueError("Layerwise-prefill group KV geometry differs")
             occupied: dict[tuple[int, int], set[int]] = {}
             for req in frozen:
+                # Advance-generation binds retire the previous incremental
+                # caches; same-generation continuations keep extending them.
+                for identity in tuple(self._plan_cache):
+                    if (
+                        identity[0] == req.request_id
+                        and identity[1] != req.allocation_generation
+                    ):
+                        del self._plan_cache[identity]
+                for identity in tuple(self._slot_cache):
+                    if (
+                        identity[0] == req.request_id
+                        and identity[1] != req.allocation_generation
+                    ):
+                        del self._slot_cache[identity]
                 if not isinstance(req.request_id, str) or any(
                     type(value) is not int
                     for value in (
@@ -261,59 +320,74 @@ class LayerwisePrefillSyncBackend:
                 stage_started = perf_counter()
                 for group in (0, 1):
                     for end in {req.restore_end, req.compute_end}:
-                        plan = (
-                            list(
-                                self._engine.token_database.process_tokens(
-                                    list(req.token_ids[:end]),
-                                    kv_group=group,
-                                    request_configs=req.request_configs,
-                                )
-                            )
-                            if end
-                            else []
+                        plans[req.request_id, group, end] = self._bind_plan(
+                            req, group, end
                         )
-                        frontier = 0
-                        for start, stop, _ in plan:
-                            if start != frontier or stop != min(start + 256, end):
-                                raise ValueError(
-                                    "Token database did not return exact chunks"
-                                )
-                            frontier = stop
-                        if frontier != end:
-                            raise ValueError("Token database omitted the partial tail")
-                        plans[req.request_id, group, end] = [
-                            (start, stop, key.with_new_worker_id(0))
-                            for start, stop, key in plan
-                        ]
                 plan_seconds += perf_counter() - stage_started
                 stage_started = perf_counter()
                 # Bank IDs originate on the host. Prepare their common position
-                # arithmetic once, rather than reading device slots back per row.
-                positions = torch.arange(
-                    req.compute_end, dtype=torch.long, device="cpu"
-                )
-                block_indices = positions // req.block_size
-                block_offsets = positions % req.block_size
+                # arithmetic once per request, rather than reading device slots
+                # back per row. The slot mapping for a same-generation
+                # continuation is append-only (bind rejects changed bank
+                # allocation above), so each per-(bank, group) tensor grows
+                # incrementally from its cached extent; a fully cached request
+                # performs no position arithmetic at all.
+                end = req.compute_end
+                cached_slots = []
+                needs_full = False
+                range_start = end
                 for bank, groups in enumerate(req.block_ids_by_bank):
-                    for group, blocks in enumerate(groups):
-                        used = occupied.setdefault((bank, group), set())
-                        if len(set(blocks)) != len(blocks) or used.intersection(blocks):
-                            raise ValueError("Layerwise-prefill request banks overlap")
-                        used.update(blocks)
-                        plane = caches[self._view.rows_by_group[group][0][0]][0]
-                        if (
-                            plane.shape[1] != req.block_size
-                            or max(blocks) >= plane.shape[0]
-                        ):
-                            raise ValueError(
-                                "Layerwise-prefill blocks exceed the KV plane"
-                            )
-                        block_tensor = torch.tensor(
-                            blocks, dtype=torch.long, device="cpu"
+                    for group, _ in enumerate(groups):
+                        key = (req.request_id, req.allocation_generation, bank, group)
+                        entry = self._slot_cache.get(key)
+                        if entry is None or entry[0] > end:
+                            needs_full = True
+                        else:
+                            range_start = min(range_start, entry[0])
+                        cached_slots.append((key, bank, group, entry))
+                if needs_full:
+                    range_start = 0
+                block_indices = block_offsets = None
+                if range_start < end:
+                    if range_start:
+                        positions = torch.arange(
+                            range_start, end, dtype=torch.long, device="cpu"
                         )
-                        slots[req.request_id, bank, group] = (
-                            block_tensor[block_indices] * req.block_size + block_offsets
+                    else:
+                        positions = torch.arange(end, dtype=torch.long, device="cpu")
+                    block_indices = positions // req.block_size
+                    block_offsets = positions % req.block_size
+                for key, bank, group, entry in cached_slots:
+                    blocks = req.block_ids_by_bank[bank][group]
+                    used = occupied.setdefault((bank, group), set())
+                    if len(set(blocks)) != len(blocks) or used.intersection(blocks):
+                        raise ValueError("Layerwise-prefill request banks overlap")
+                    used.update(blocks)
+                    plane = caches[self._view.rows_by_group[group][0][0]][0]
+                    if (
+                        plane.shape[1] != req.block_size
+                        or max(blocks) >= plane.shape[0]
+                    ):
+                        raise ValueError("Layerwise-prefill blocks exceed the KV plane")
+                    if entry is not None and entry[0] == end:
+                        slots[key[:1] + key[2:]] = entry[1]
+                        continue
+                    block_tensor = torch.tensor(blocks, dtype=torch.long, device="cpu")
+                    if entry is not None and entry[0] < end and not needs_full:
+                        offset = entry[0] - range_start
+                        addition = (
+                            block_tensor[block_indices[offset:]] * req.block_size
+                            + block_offsets[offset:]
                         )
+                        grown = torch.empty(end, dtype=torch.long, device="cpu")
+                        grown[: entry[0]].copy_(entry[1])
+                        grown[entry[0] :].copy_(addition)
+                    else:
+                        grown = block_tensor[block_indices] * req.block_size + (
+                            block_offsets
+                        )
+                    self._slot_cache[key] = (end, grown)
+                    slots[key[:1] + key[2:]] = grown
                 slot_seconds += perf_counter() - stage_started
             self._engine.initialize_layerwise_prefill_layout(caches)
             prepare = getattr(
@@ -694,6 +768,7 @@ class LayerwisePrefillSyncBackend:
                 error = error or exc
             self._ack(("commit",), error)
             self._step_future.set_result(None)
+            self._collect_young_after_commit()
         persist_seconds = perf_counter() - persist_started
         # Host-observed wall times include synchronization waits, not isolated
         # NPU kernel time. Emit no per-layer records or diagnostic device reads.
@@ -767,6 +842,12 @@ class LayerwisePrefillSyncBackend:
             self._released[request_id] = max(
                 req.allocation_generation, self._released.get(request_id, 0)
             )
+        for identity in tuple(self._plan_cache):
+            if identity[0] == request_id:
+                del self._plan_cache[identity]
+        for identity in tuple(self._slot_cache):
+            if identity[0] == request_id:
+                del self._slot_cache[identity]
         for identity in tuple(self._prefixes):
             if identity[0] == request_id:
                 self._release(self._prefixes.pop(identity).objects)
@@ -1010,6 +1091,109 @@ class LayerwisePrefillSyncBackend:
 
     def _drain_required_remote(self) -> None:
         """Join any deferred strict puts before the final all-TP commit ACK."""
+
+    def _bind_plan(
+        self, req: LayerwisePrefillRequest, group: int, end: int
+    ) -> list[tuple]:
+        """Return the transformed chunk plan for [0, end), extending the cache.
+
+        The per-(request, generation, group) cache holds one 256-aligned
+        high-water extent, its transformed plan and the rolling chunk-hash
+        chain state (seeded into process_tokens via initial_hash), so a
+        continuation recomputes only the new chunks and reproduces the exact
+        full-sequence keys with the same process_tokens call count as the
+        previous full recomputation. A trailing partial chunk never enters the
+        cache; re-querying a smaller extent — including an unaligned one — is
+        an exact prefix slice plus, when needed, one fresh tail chunk seeded
+        from the boundary chunk's chain state. Frontier checks keep the
+        exact-chunks contract; the bind gate's digest still compares the
+        complete plans across ranks.
+        """
+        if end <= 0:
+            return []
+        key = (req.request_id, req.allocation_generation, group)
+        aligned_end, cached, chain = self._plan_cache.get(key, (0, (), None))
+        if end > aligned_end:
+            cached, chain, tail = self._extend_bind_plan(
+                req, group, aligned_end, end, cached, chain
+            )
+            self._plan_cache[key] = (end - end % 256, cached, chain)
+            plan = list(cached) if tail is None else [*cached, tail]
+        elif not end % 256:
+            return list(cached[: end // 256])
+        else:
+            base = end - end % 256
+            prefix = cached[: base // 256]
+            seed = prefix[-1][2].chunk_hash if prefix else None
+            entries = self._engine.token_database.process_tokens(
+                list(req.token_ids[base:end]),
+                kv_group=group,
+                request_configs=req.request_configs,
+                initial_hash=seed,
+            )
+            tail = [
+                (base + start, base + stop, entry_key.with_new_worker_id(0))
+                for start, stop, entry_key in entries
+            ]
+            if len(tail) != 1 or tail[0][0] != base or tail[0][1] != end:
+                raise ValueError("Token database did not return exact chunks")
+            plan = [*prefix, *tail]
+        frontier = 0
+        for start, stop, _ in plan:
+            if start != frontier or stop != min(start + 256, end):
+                raise ValueError("Token database did not return exact chunks")
+            frontier = stop
+        if frontier != end:
+            raise ValueError("Token database omitted the partial tail")
+        return plan
+
+    def _extend_bind_plan(
+        self,
+        req: LayerwisePrefillRequest,
+        group: int,
+        aligned_end: int,
+        end: int,
+        cached: tuple,
+        chain: int | None,
+    ) -> tuple[tuple, int | None, tuple | None]:
+        """Extend past the high-water extent; return (plan, chain, tail).
+
+        The one process_tokens call covers [aligned_end, end) including any
+        trailing partial chunk. Full chunks extend the cached plan and update
+        the chain state; a partial chunk is returned separately and never
+        cached, keeping the high-water extent aligned.
+        """
+        entries = self._engine.token_database.process_tokens(
+            list(req.token_ids[aligned_end:end]),
+            kv_group=group,
+            request_configs=req.request_configs,
+            initial_hash=chain,
+        )
+        extension = []
+        tail = None
+        frontier = aligned_end
+        state = chain
+        for start, stop, entry_key in entries:
+            absolute_start, absolute_stop = aligned_end + start, aligned_end + stop
+            if absolute_start != frontier or absolute_stop != min(
+                absolute_start + 256, end
+            ):
+                raise ValueError("Token database did not return exact chunks")
+            transformed = entry_key.with_new_worker_id(0)
+            if absolute_stop - absolute_start == 256:
+                extension.append((absolute_start, absolute_stop, transformed))
+                state = transformed.chunk_hash
+            else:
+                tail = (absolute_start, absolute_stop, transformed)
+            frontier = absolute_stop
+        if frontier != end or (tail is not None) != bool(end % 256):
+            raise ValueError("Token database omitted the partial tail")
+        return cached + tuple(extension), state, tail
+
+    def _collect_young_after_commit(self) -> None:
+        """Plan C stepwise: one bounded young collection after the commit gate."""
+        if self._gc_mode == "stepwise":
+            gc.collect(0)
 
     def _plan(
         self, req: LayerwisePrefillRequest, end: int, group: int, row: int
