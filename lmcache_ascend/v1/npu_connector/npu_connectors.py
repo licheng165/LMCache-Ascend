@@ -1978,11 +1978,24 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         (expected,),
                         0,
                     )
-                    if len(memo) > 8192:
+                    # Hysteresis purge: a live-prefix workload (the common case)
+                    # never frees entries, so a fixed threshold would rescan
+                    # the whole table on every insert once crossed. After one
+                    # sweep the limit doubles past the live size, making the
+                    # next sweep require at least `live` new entries - the
+                    # scan cost amortizes to O(1) per insert while dead
+                    # entries still get reclaimed once they outnumber the
+                    # live set.
+                    if len(memo) > getattr(
+                        self, "_layerwise_prefill_chunk_memo_limit", 8192
+                    ):
                         for stale in [
                             key for key, item in memo.items() if item[0]() is None
                         ]:
                             del memo[stale]
+                        self._layerwise_prefill_chunk_memo_limit = max(
+                            8192, 2 * len(memo)
+                        )
             offsets.append(total_tokens)
             sizes.append(size)
             if ranges and ranges[-1][1] != local_start:

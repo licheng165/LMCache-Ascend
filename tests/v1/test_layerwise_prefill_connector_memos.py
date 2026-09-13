@@ -215,6 +215,72 @@ def test_slots_shorter_mapping_revalidates_fully(memos_row_env):
     assert env.connector._layerwise_prefill_slots_cache[identity][2] == 32
 
 
+def test_chunk_memo_purge_is_amortized_not_per_insert(memos_row_env):
+    env = memos_row_env
+    connector = env.connector
+    # Regression: a fixed purge threshold rescans the whole memo on EVERY
+    # insert once a live-prefix workload (entries never die) crosses it -
+    # 0912-2 deployed as O(N)-per-insert and exploded prepare_load/save.
+    # Hysteresis must instead sweep once and double past the live size.
+    connector._layerwise_prefill_chunk_memo_limit = 16
+    planes = env.planes(0)
+    mapping = torch.tensor([0], dtype=torch.int64)
+    batches = 12
+    per_batch = 9
+    retained = []
+    for _ in range(batches):
+        chunks = _chunks(planes, [1] * per_batch)
+        retained.extend(chunks)
+        for chunk in chunks:
+            env.connector.transfer_layerwise_prefill_row(
+                planes, [chunk], [0], [1], mapping, kv_group=0, direction=True
+            )
+    memo = connector._layerwise_prefill_chunk_memo
+    assert len(memo) == batches * per_batch
+    assert connector._layerwise_prefill_chunk_memo_limit >= 2 * len(memo)
+    assert _registrations(env) == batches * per_batch
+    assert all(entry[0]() is not None for entry in memo.values())
+    # A fresh wave of live inserts must not shrink the limit below the
+    # doubled live size (no rescan thrash): the limit only grows.
+    before = connector._layerwise_prefill_chunk_memo_limit
+    for chunk in _chunks(planes, [1] * 4):
+        env.connector.transfer_layerwise_prefill_row(
+            planes, [chunk], [0], [1], mapping, kv_group=0, direction=True
+        )
+    assert connector._layerwise_prefill_chunk_memo_limit >= before
+    assert len(memo) == batches * per_batch + 4
+    assert all(retained[batch * per_batch] is not None for batch in range(batches))
+
+
+def test_chunk_memo_dead_entries_are_reclaimed_by_hysteresis(memos_row_env):
+    env = memos_row_env
+    connector = env.connector
+    connector._layerwise_prefill_chunk_memo_limit = 8
+    planes = env.planes(0)
+    mapping = torch.tensor([0], dtype=torch.int64)
+
+    def wave(count: int) -> list:
+        chunks = _chunks(planes, [1] * count)
+        for chunk in chunks:
+            env.connector.transfer_layerwise_prefill_row(
+                planes, [chunk], [0], [1], mapping, kv_group=0, direction=True
+            )
+        return chunks
+
+    import gc
+
+    wave(6)
+    gc.collect()
+    live_chunks = wave(6)
+    memo = connector._layerwise_prefill_chunk_memo
+    # The second wave's sweep (triggered past the limit) must have dropped
+    # the first wave's dead entries instead of growing unboundedly.
+    assert len(memo) <= 12
+    live = sum(1 for entry in memo.values() if entry[0]() is not None)
+    assert live == 6
+    assert memo[id(live_chunks[0])][0]() is live_chunks[0]
+
+
 def test_slots_cache_is_bounded_fifo(memos_row_env):
     env = memos_row_env
     capacity = 128
